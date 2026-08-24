@@ -961,8 +961,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                 Tensor(g!)? compact_miss_counts=None,"
       "                 Tensor? resident_block_table=None,"
       "                 int resident_block_size=0,"
-      "                 int resident_null_block=0,"
-      "                 int row_value_bytes=0) -> ()");
+      "                 int resident_null_block=0) -> ()");
 
   ops.def(
       "hisparse_gather_plan(Tensor host_cache,"
@@ -972,23 +971,20 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                     Tensor miss_mask,"
       "                     Tensor? request_state_indices,"
       "                     Tensor(a!)? attention_indices=None,"
-      "                     int attention_block_stride=0,"
-      "                     int row_value_bytes=0) -> ()");
+      "                     int attention_block_stride=0) -> ()");
 
   ops.def(
       "hisparse_gather_compact(Tensor host_cache,"
       "                        Tensor! hot_cache,"
       "                        Tensor miss_global_indices,"
       "                        Tensor miss_hot_indices,"
-      "                        Tensor miss_counts,"
-      "                        int row_value_bytes=0) -> ()");
+      "                        Tensor miss_counts) -> ()");
 
   ops.def(
       "hisparse_backup(Tensor src_cache,"
       "                Tensor src_indices,"
       "                Tensor! host_cache,"
-      "                Tensor dst_slots,"
-      "                int row_value_bytes=0) -> ()");
+      "                Tensor dst_slots) -> ()");
 
   ops.def(
       "hisparse_backup_layers(Tensor hot_backing,"
@@ -1000,8 +996,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                        int num_items,"
       "                        int src_block_stride,"
       "                        int src_block_size,"
-      "                        int src_rows,"
-      "                        int row_value_bytes=0) -> ()");
+      "                        int src_rows) -> ()");
 
   ops.def(
       "hisparse_backup_indexer(Tensor src_cache,"
