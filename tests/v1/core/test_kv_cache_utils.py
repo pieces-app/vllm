@@ -164,7 +164,7 @@ def test_hisparse_hma_offloads_only_deepseek_v4_c4_layers():
             head_size=512,
             dtype=torch.uint8,
             cache_dtype_str="fp8_ds_mla",
-            compress_ratio=compress_ratio,
+            tokens_per_state=compress_ratio,
             model_version="deepseek_v4",
             alignment=576,
             supported_kernel_block_sizes=(256,),
@@ -177,7 +177,7 @@ def test_hisparse_hma_offloads_only_deepseek_v4_c4_layers():
             num_kv_heads=1,
             head_size=132,
             dtype=torch.uint8,
-            compress_ratio=compress_ratio,
+            tokens_per_state=compress_ratio,
             supported_kernel_block_sizes=(256,),
             cache_role=SparseCacheRole.INDEXER,
         )
@@ -221,7 +221,7 @@ def test_hisparse_hma_offloads_only_deepseek_v4_c4_layers():
         name
         for tensor in cache_config.kv_cache_tensors
         if tensor.host_resident
-        for name in tensor.shared_by
+        for name in tensor.layers
     }
     assert host_layers == {c4_main, f"{c4_indexer}.hisparse_source"}
     transferable_device_layers = {

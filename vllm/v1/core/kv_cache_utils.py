@@ -1396,7 +1396,7 @@ def _get_hisparse_hma_config(
         specs = {
             name: spec
             for name, spec in all_full_specs.items()
-            if isinstance(spec, MLAAttentionSpec) and spec.compress_ratio == 4
+            if isinstance(spec, MLAAttentionSpec) and spec.tokens_per_state == 4
         }
         if not specs:
             raise ValueError(
@@ -1476,7 +1476,7 @@ def _get_hisparse_hma_config(
 
     indexer_page = sum(spec.page_size_bytes for spec in gpu_indexer_specs.values())
     storage_block_sizes = {
-        spec.storage_block_size
+        spec.num_states
         for spec in gpu_indexer_specs.values()
         if isinstance(spec, MLAAttentionSpec)
     }
@@ -1707,7 +1707,7 @@ def _hisparse_gpu_memory_usage(
         or (
             is_deepseek_v4
             and isinstance(spec, MLAAttentionSpec)
-            and spec.compress_ratio != 4
+            and spec.tokens_per_state != 4
         )
     )
     return full_group_bytes + sum(
