@@ -4,7 +4,6 @@
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LoadSpec,
@@ -16,29 +15,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
     MooncakeStoreScheduler,
 )
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-)
-
-
-def _single_transfer_group_config() -> KVCacheConfig:
-    return KVCacheConfig(
-        num_blocks=1,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer"],
-                FullAttentionSpec(
-                    block_size=16,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            )
-        ],
-    )
 
 
 def _make_bare_scheduler(
@@ -57,7 +33,9 @@ def _make_bare_scheduler(
     scheduler._block_size = 16
     scheduler._hash_block_size = hash_block_size
     scheduler.enable_partial_hash_hits = enable_partial_hash_hits
-    scheduler.kv_cache_config = _single_transfer_group_config()
+    scheduler.kv_cache_config = SimpleNamespace(
+        select_transfer_block_ids=lambda block_ids: tuple(block_ids)
+    )
     scheduler.load_specs = {}
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
@@ -204,20 +182,18 @@ def _add_unfinished_request(
     )
 
 
-def test_transfer_block_ids_excludes_nontransfer_groups():
+def test_update_state_excludes_nontransfer_groups():
     """Store metadata must match the worker's registered cache groups."""
     scheduler = _make_bare_scheduler()
-    spec = scheduler.kv_cache_config.kv_cache_groups[0].kv_cache_spec
-    scheduler.kv_cache_config = KVCacheConfig(
-        num_blocks=1,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(["layer.0"], spec),
-            KVCacheGroupSpec(["layer.1"], spec, enable_kv_transfer=False),
-        ],
+    scheduler.kv_cache_config = SimpleNamespace(
+        select_transfer_block_ids=lambda block_ids: (block_ids[0],)
     )
+    request = SimpleNamespace(request_id="req-1")
+    blocks = SimpleNamespace(get_block_ids=lambda: ([1, 2], [9]))
 
-    assert scheduler._transfer_block_ids(([1, 2], [9])) == ([1, 2],)
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=32)
+
+    assert scheduler._unfinished_requests["req-1"][1] == ([1, 2],)
 
 
 def _setup_decode_request(
