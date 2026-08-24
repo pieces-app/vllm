@@ -255,14 +255,11 @@ class NixlBaseConnectorScheduler:
         for per-step partial lists (host-buffer save), where the SSM strip
         does not apply.
         """
-        if len(block_ids) == len(self.kv_cache_config.kv_cache_groups):
-            block_ids = self.kv_cache_config.select_transfer_block_ids(block_ids)
-        num_transfer_groups = len(self.kv_cache_config.transfer_groups)
-        assert len(block_ids) in (0, num_transfer_groups), (
-            "Number of transferable KV cache groups must match"
-        )
-        if len(block_ids) == 0 or not self._is_hma_required:
-            # No blocks to clip eg Full prefix cache hit or not a hybrid model.
+        if len(block_ids) == 0:
+            # No blocks to clip, e.g. a full prefix cache hit.
+            return block_ids
+        block_ids = self.kv_cache_config.select_transfer_block_ids(block_ids)
+        if not self._is_hma_required:
             return block_ids
         # NOTE (NickLucche) This logic is currently handled at the connector level
         # because offloading connectors might want to receive the whole sequence even
