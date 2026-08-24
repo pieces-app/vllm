@@ -14,6 +14,7 @@ from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 
@@ -60,6 +61,58 @@ class PagedCacheView:
             raw_tensor[byte_offset:].view(dtype).view(-1, block_size, row_width)
         )
         return cls(cache, attention_cache, block_size, block_stride // row_bytes)
+
+
+@triton.jit
+def _compress_hisparse_slot_mapping_kernel(
+    source_ptr,
+    positions_ptr,
+    output_ptr,
+    num_tokens,
+    logical_block_size: tl.constexpr,
+    storage_block_size: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < num_tokens
+    source = tl.load(source_ptr + offset, mask=mask, other=-1)
+    position = tl.load(positions_ptr + offset, mask=mask, other=-1)
+    valid = (source >= 0) & ((position + 1) % compress_ratio == 0)
+    compressed = (
+        source // logical_block_size * storage_block_size
+        + source % logical_block_size // compress_ratio
+    )
+    tl.store(output_ptr + offset, tl.where(valid, compressed, -1), mask=mask)
+
+
+def compress_hisparse_slot_mapping(
+    source: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    logical_block_size: int,
+    storage_block_size: int,
+    compress_ratio: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Map uncompressed HMA slots to a compressed physical cache."""
+    num_tokens = min(source.numel(), positions.numel())
+    if out is None:
+        out = torch.empty_like(source)
+    out.fill_(-1)
+    if num_tokens:
+        block = 256
+        _compress_hisparse_slot_mapping_kernel[(triton.cdiv(num_tokens, block),)](
+            source,
+            positions,
+            out,
+            num_tokens,
+            logical_block_size=logical_block_size,
+            storage_block_size=storage_block_size,
+            compress_ratio=compress_ratio,
+            BLOCK_SIZE=block,
+        )
+    return out[:num_tokens]
 
 
 @dataclass(frozen=True)
@@ -320,6 +373,7 @@ class HiSparseRuntime:
         row_width: int,
         kv_dtype: torch.dtype,
         device: torch.device | str,
+        storage_block_size: int | None = None,
         max_swap_rows: int | None = None,
         index_group: HiSparseIndexGroup | None = None,
     ) -> None:
@@ -334,6 +388,7 @@ class HiSparseRuntime:
         self.row_width = row_width
         self.kv_dtype = kv_dtype
         self.device = torch.device(device)
+        self.storage_block_size = storage_block_size
         # Logical slots per request. Physical rows come from its ephemeral HMA
         # block table and need not be contiguous in the shared slab.
         self.region_stride = config.device_buffer_size
@@ -379,6 +434,7 @@ class HiSparseRuntime:
         block_table: torch.Tensor,
     ) -> None:
         """Bind this runtime's strided view into the shared GPU HMA slab."""
+        storage_block_size = self.storage_block_size or block_size
         self.hot = PagedCacheView.bind(
             raw_tensor,
             dtype=self.kv_dtype,
@@ -386,7 +442,7 @@ class HiSparseRuntime:
             byte_offset=byte_offset,
             block_stride=block_stride,
             num_blocks=num_blocks,
-            block_size=block_size,
+            block_size=storage_block_size,
         )
         self.hot_block_table = block_table
 
@@ -644,6 +700,8 @@ class HiSparseCacheHandle:
         self.view: PagedCacheView | None = None
         self.block_table: torch.Tensor | None = None
         self.slot_mapping: torch.Tensor | None = None
+        self.compressed_slot_mapping: torch.Tensor | None = None
+        self.logical_block_size = 0
         self.runtime = runtime
         self.decode_batch = False
 
@@ -658,6 +716,7 @@ class HiSparseCacheHandle:
         block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        storage_block_size = self.runtime.storage_block_size or block_size
         self.view = PagedCacheView.bind(
             raw_tensor,
             dtype=self.runtime.kv_dtype,
@@ -665,10 +724,28 @@ class HiSparseCacheHandle:
             byte_offset=byte_offset,
             block_stride=block_stride,
             num_blocks=num_blocks,
-            block_size=block_size,
+            block_size=storage_block_size,
         )
         self.block_table = block_table
         self.slot_mapping = slot_mapping
+        if self.runtime.storage_block_size is not None:
+            self.compressed_slot_mapping = torch.empty_like(slot_mapping)
+        self.logical_block_size = block_size
+
+    def get_compressed_slot_mapping(
+        self, positions: torch.Tensor, compress_ratio: int
+    ) -> torch.Tensor:
+        assert self.slot_mapping is not None
+        assert self.compressed_slot_mapping is not None
+        assert self.view is not None
+        return compress_hisparse_slot_mapping(
+            self.slot_mapping,
+            positions,
+            logical_block_size=self.logical_block_size,
+            storage_block_size=self.view.block_size,
+            compress_ratio=compress_ratio,
+            out=self.compressed_slot_mapping,
+        )
 
     def write_rows(
         self,
@@ -746,6 +823,7 @@ def create_hisparse_cache_handle(
     kv_dtype: torch.dtype,
     index_group_builder: HiSparseIndexGroupBuilder | None = None,
     device: torch.device | str | None = None,
+    storage_block_size: int | None = None,
 ) -> HiSparseCacheHandle | None:
     config = ResolvedHiSparseConfig.from_vllm_config(vllm_config, model_top_k)
     if config is None:
@@ -784,6 +862,7 @@ def create_hisparse_cache_handle(
         row_width=row_width,
         kv_dtype=kv_dtype,
         device=device,
+        storage_block_size=storage_block_size,
         index_group=index_group,
     )
     if is_index_group_leader and index_group_builder is not None:

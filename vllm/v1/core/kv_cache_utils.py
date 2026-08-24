@@ -1525,7 +1525,20 @@ def _get_hisparse_hma_config(
     )
 
     indexer_page = sum(spec.page_size_bytes for spec in gpu_indexer_specs.values())
-    hot_blocks_per_request = cdiv(config.device_buffer_size, gpu_block_size)
+    storage_block_sizes = {
+        spec.storage_block_size
+        for spec in gpu_indexer_specs.values()
+        if isinstance(spec, MLAAttentionSpec)
+    }
+    if not storage_block_sizes:
+        storage_block_size = gpu_block_size
+    elif len(storage_block_sizes) == 1:
+        storage_block_size = storage_block_sizes.pop()
+    else:
+        raise ValueError(
+            "HiSparse indexer layers require one physical cache block size."
+        )
+    hot_blocks_per_request = cdiv(config.device_buffer_size, storage_block_size)
 
     hot_units: list[list[tuple[str, KVCacheSpec]]] = []
     for layer_name, layer_spec in host_specs.items():
@@ -1594,6 +1607,9 @@ def _get_hisparse_hma_config(
     if current:
         append_hot_group(current)
 
+    remaining_full_specs = {
+        name: spec for name, spec in all_full_specs.items() if name not in specs
+    }
     source_group_spec = UniformTypeKVCacheSpecs.from_specs(source_specs)
     assert source_group_spec is not None
     source_group = KVCacheGroupSpec(
@@ -1604,6 +1620,18 @@ def _get_hisparse_hma_config(
         role=KVCacheGroupRole.HISPARSE_SOURCE,
     )
 
+    gpu_regular_groups: list[KVCacheGroupSpec] = []
+    if remaining_full_specs:
+        remaining_full_spec = UniformTypeKVCacheSpecs.from_specs(remaining_full_specs)
+        assert remaining_full_spec is not None
+        gpu_regular_groups.append(
+            KVCacheGroupSpec(
+                list(remaining_full_specs),
+                remaining_full_spec,
+                is_eagle_group=group.is_eagle_group,
+                block_pool_id=0,
+            )
+        )
     gpu_other_regular_groups = [
         KVCacheGroupSpec(
             layer_names=regular.layer_names,
@@ -1620,6 +1648,7 @@ def _get_hisparse_hma_config(
         indexer_group,
         *resident_groups,
         *hot_groups,
+        *gpu_regular_groups,
         *gpu_other_regular_groups,
     ]
     gpu_stride, gpu_layers_by_offset = _get_packed_kv_cache_layout(gpu_groups)
@@ -1678,6 +1707,7 @@ def _get_hisparse_hma_config(
             indexer_group,
             *resident_groups,
             *hot_groups,
+            *gpu_regular_groups,
             *gpu_other_regular_groups,
         ],
         hisparse_host_num_blocks=host_num_blocks,
