@@ -75,6 +75,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
 )
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
+    get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -83,9 +84,9 @@ from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.network_utils import make_zmq_path
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheLayout,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -109,6 +110,13 @@ def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
         (0, int(part)) if part.isdigit() else (1, part)
         for part in re.split(r"(\d+)", layer_name)
     )
+
+
+def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
+    """Return whether all views share storage and a block stride."""
+    block_strides = {cache.stride(0) * cache.element_size() for cache in caches}
+    storage_ptrs = {cache.untyped_storage().data_ptr() for cache in caches}
+    return len(block_strides) == len(storage_ptrs) == 1
 
 
 class NixlBaseConnectorWorker:
@@ -367,7 +375,6 @@ class NixlBaseConnectorWorker:
             for group in kv_cache_config.transfer_groups
             for layer in group.layer_names
         }
-        self.hma_group_size = len(kv_cache_config.kv_cache_tensors)
 
         # ---- Model state (derived from model config) ----
         mamba_ssm_size = (0, 0)
@@ -432,6 +439,9 @@ class NixlBaseConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.world_size = get_tensor_model_parallel_world_size()
+        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
 
         self.num_blocks = kv_cache_config.num_blocks
         self.enable_permute_local_kv = False
@@ -605,7 +615,9 @@ class NixlBaseConnectorWorker:
         self.attn_backends = get_current_attn_backends(vllm_config)
         self.backend_name = self.attn_backends[0].get_name()
 
-        self.kv_cache_layout = get_kv_cache_layout()
+        self.kv_cache_layout = (
+            vllm_config.cache_config.get_resolved_kv_cache_layout().name
+        )
         self.host_buffer_kv_cache_layout = self.kv_cache_layout
         logger.info(
             "Detected attention backend(s) %s",
@@ -640,12 +652,34 @@ class NixlBaseConnectorWorker:
         # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
         self.block_len_per_layer = list[int]()
 
+        # Per-region block stride in bytes. Taken from the registered tensor's
+        # stride(0) so it stays correct under layouts that interleave layers
+        # within a block (BLHNC/BHLNC), where stride > block_len.
+        self.block_stride_per_layer = list[int]()
+
         # Per-engine TP mappings. Generated during handshake.
         self.tp_mappings: dict[EngineId, TPMapping] = {}
 
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
         )
+
+    def _validate_remote_parallel_config(
+        self, agent_metadata: NixlAgentMetadata
+    ) -> None:
+        local_pcp_size = self.pcp_size
+        local_dcp_size = self.dcp_size
+        remote_pcp_size = agent_metadata.pcp_size
+        remote_dcp_size = agent_metadata.dcp_size
+        if (local_pcp_size > 1 and remote_dcp_size > 1) or (
+            remote_pcp_size > 1 and local_dcp_size > 1
+        ):
+            raise NotImplementedError(
+                "NixlConnector PCP requires decode_context_parallel_size=1 "
+                "on both instances. "
+                f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
+                f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+            )
 
     def _sync_block_size_with_kernel(self) -> None:
         backends = get_current_attn_backends(self.vllm_config)
@@ -786,6 +820,8 @@ class NixlBaseConnectorWorker:
                         f"Failed to decode NixlAgentMetadata. Error: {e}"
                     ) from e
 
+                self._validate_remote_parallel_config(metadata)
+
                 # Ensure engine id matches.
                 if metadata.engine_id != expected_engine_id:
                     raise RuntimeError(
@@ -851,16 +887,16 @@ class NixlBaseConnectorWorker:
                 if not self.use_mla:
                     assert kv_cache.ndim == 4
 
-                    if self.kv_cache_layout == "NHD":
+                    if self.kv_cache_layout == "LBNHC":
                         if self.kv_transfer_config.enable_permute_local_kv:
                             logger.info_once(
                                 "'enable_permute_local_kv' flag is enabled while "
-                                "device KV Layout is NHD. Init host buffer with"
-                                " HND to better support Decode/Prefill TP_ratio > 1."
+                                "device KV Layout is LBNHC. Init host buffer with"
+                                " LBHNC to better support Decode/Prefill TP_ratio > 1."
                             )
-                            # Since NHD will not support Decode/Prefill TP_ratio > 1,
+                            # Since LBNHC will not support Decode/Prefill TP_ratio > 1,
                             # we can leverage host_buffer for permute.
-                            self.host_buffer_kv_cache_layout = "HND"
+                            self.host_buffer_kv_cache_layout = "LBHNC"
                         else:
                             # Packed KV layout is logical (B, H, N, 2*D). Allocate
                             # (B, N, H, 2*D) and view it as logical (B, H, N, 2*D)
@@ -1032,124 +1068,11 @@ class NixlBaseConnectorWorker:
 
         fut.add_done_callback(request_ready)
 
-    def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
-        """Register a cross-layers KV cache tensor with NIXL.
-
-        `use_uniform_kv_cache()` guarantees a single KV cache group whose
-        layers all share the same `AttentionSpec`, so any layer name from
-        `_layer_specs` yields the correct per-layer spec for `page_size_bytes`.
-        """
-        first_layer = next(iter(self._layer_specs))
-        # Forwarding a real layer name rather than a synthetic key
-        self.register_kv_caches({first_layer: kv_cache})
-
-    def _register_packed_kv_cache(
-        self,
-        storage: torch.UntypedStorage,
-    ) -> None:
-        """Register a packed KV cache as a single NIXL region.
-
-        The packed allocation interleaves all layers per block, so each
-        block_stride-byte chunk is one logical block.  We register 1
-        NIXL region and create 1 descriptor per block.
-        """
-        self.transfer_topo = TransferTopology(
-            tp_rank=self.tp_rank,
-            tp_size=self.world_size,
-            block_size=self.block_size,
-            engine_id=self.engine_id,
-            is_mla=self.use_mla,
-            total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
-            attn_backends=self.attn_backends,
-            tensor_shape=None,
-            is_mamba=self._has_mamba,
-        )
-        self.compat_hash = compute_nixl_compatibility_hash(
-            self.vllm_config,
-            self.backend_name,
-            self.transfer_topo.cross_layers_blocks,
-            transfer_mode=self._TRANSFER_MODE,
-        )
-
-        total_size = storage.nbytes()
-        block_stride = total_size // self.num_blocks
-        base_addr = storage.data_ptr()
-        device_id = storage.device.index
-        assert device_id is not None
-
-        logger.info(
-            "Registering packed KV cache: total_size=%s, block_stride=%s, "
-            "num_blocks=%s, num_regions=1",
-            total_size,
-            block_stride,
-            self.num_blocks,
-        )
-
-        self.device_id = device_id
-        caches_data = [(base_addr, total_size, self.device_id, "")]
-
-        self.block_len_per_layer = [block_stride]
-        self.region_strides = [block_stride]
-        self.region_group_ids = [0]
-        self.region_block_sizes = [self.block_size]
-        self.region_names = ["__cross_layers__"]
-        self.region_num_blocks = [self.num_blocks]
-        self._region_is_mla = [self.use_mla]
-        self.num_regions = 1
-        self.num_descs = self.num_blocks
-        self.region_mem_types = [self.nixl_memory_type]
-        self._mixed_mem_types = False
-        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = [base_addr]
-
-        descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
-        self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
-        self._registered_descs.append(descs)
-
-        self.dst_num_blocks[self.engine_id] = self.num_blocks
-        self.dst_region_num_blocks[self.engine_id] = self.region_num_blocks
-        self.dst_region_group_ids[self.engine_id] = self.region_group_ids
-        self.dst_region_block_sizes[self.engine_id] = self.region_block_sizes
-        self.dst_region_split_ratios[self.engine_id] = [1]
-
-        self.src_xfer_handles_by_block_size[self.block_size], (self.src_blocks_data) = (
-            self.register_local_xfer_handler(self.block_size)
-        )
-
-        agent_metadata = NixlAgentMetadata(
-            engine_id=self.engine_id,
-            agent_metadata=self.nixl_wrapper.get_agent_metadata(),
-            device_id=self.device_id,
-            kv_caches_base_addr=(
-                self.kv_caches_base_addr[self.engine_id][self.tp_rank]
-            ),
-            num_blocks=self.num_blocks,
-            block_lens=self.block_len_per_layer,
-            kv_cache_layout=self.kv_cache_layout,
-            block_size=self.block_size,
-            ssm_sizes=self._mamba_ssm_size,
-            attn_backend_name=self.backend_name,
-            physical_blocks_per_logical_kv_block=(
-                self._physical_blocks_per_logical_kv_block
-            ),
-            region_strides=self.region_strides,
-            region_num_blocks=self.region_num_blocks,
-            region_group_ids=self.region_group_ids,
-            region_block_sizes=self.region_block_sizes,
-            region_names=self.region_names,
-        )
-        assert self.compat_hash is not None
-        encoder = msgspec.msgpack.Encoder()
-        self.xfer_handshake_metadata = NixlHandshakePayload(
-            compatibility_hash=self.compat_hash,
-            agent_metadata_bytes=encoder.encode(agent_metadata),
-        )
-
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
         if self._nixl_adapter is not None:
             self._nixl_adapter.reset_regions()
-
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.world_size,
@@ -1167,7 +1090,6 @@ class NixlBaseConnectorWorker:
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config,
             self.backend_name,
-            self.transfer_topo.cross_layers_blocks,
             transfer_mode=self._TRANSFER_MODE,
         )
 
@@ -1195,9 +1117,14 @@ class NixlBaseConnectorWorker:
 
         registration_ranges: dict[tuple[int, str], tuple[int, int, int]] = {}
         region_mem_types: list[str] = []
-        # With hybrid allocator, layers can share a kv cache tensor
         seen_base_addresses: list[int] = []
-        seen_regions: dict[int | tuple[int, int], int] = {}
+        tensor_configs = {
+            layer_name: tensor_config
+            for tensor_config in self.kv_cache_config.kv_cache_tensors
+            for layer_name in tensor_config.layers
+        }
+
+        packed_storage = _share_storage_and_block_stride(list(xfer_buffers.values()))
 
         # K and V are packed into the content dim, so each attention layer is a
         # single NIXL region whose block transfers as one unit. Mamba layers instead
@@ -1238,11 +1165,6 @@ class NixlBaseConnectorWorker:
                 else layer_spec.page_size_bytes
                 // self._physical_blocks_per_logical_kv_block
             )
-            if self.transfer_topo._cross_layers_blocks:
-                # When cross-layers blocks are used, multiply by number of layers
-                physical_page_size = physical_page_size * len(
-                    self.kv_cache_config.kv_cache_tensors
-                )
             group = self.kv_cache_config.transfer_groups[group_index]
             if group.block_pool_id is None:
                 logical_num_blocks = self._logical_num_blocks
@@ -1256,6 +1178,7 @@ class NixlBaseConnectorWorker:
                 )
             elif group.block_pool_id is None:
                 raise ValueError("NIXL transfer group has no block pool")
+            group_id = group_index
             num_blocks = (
                 logical_num_blocks
                 if isinstance(layer_spec, MambaSpec)
@@ -1268,60 +1191,121 @@ class NixlBaseConnectorWorker:
                 self._nixl_adapter is not None
                 and self._nixl_adapter.is_mla_region(layer_spec)
             )
-            region_block_len = (
-                physical_page_size // self._physical_blocks_per_logical_kv_block
-                if isinstance(layer_spec, MambaSpec)
-                else physical_page_size
-            )
-            region_stride = (
-                cache.stride()[0] * cache.element_size()
-                if cache.ndim > 1
-                else region_block_len
-            )
-            is_packed_region = region_stride != region_block_len
-            region_key = (
-                (base_addr, group_index)
-                if is_packed_region and not self._has_mamba
-                else base_addr
-            )
-            if region_key in seen_regions:
-                # A shared tensor may back both SSM and attention layers (e.g.
-                # KDA+MLA in KimiLinear); the region's FA view is MLA whichever
-                # layer registered it first. All-attention packed groups instead
-                # overlay storage while retaining independent block tables.
-                idx = seen_regions[region_key]
-                self._region_is_mla[idx] |= is_mla_region
-                if self.region_group_ids[idx] != group_index:
-                    self.region_group_ids[idx] = _SHARED_REGION_GROUP_ID
-                if is_mla_region:
-                    self.region_block_sizes[idx] = (
-                        layer_spec.block_size
-                        // self._physical_blocks_per_logical_kv_block
-                    )
-                logger.debug("Skipping %s because it's already seen", layer_name)
-                continue
             logger.debug(
                 "Registering layer %s with cache shape: %s", layer_name, cache.shape
             )
-            seen_regions[region_key] = len(seen_base_addresses)
-            seen_base_addresses.append(base_addr)
-            # Only record non-Mamba page sizes.
-            self.block_len_per_layer.append(region_block_len)
-            self.region_strides.append(region_stride)
-            self.region_group_ids.append(group_index)
-            region_block_size = (
-                layer_spec.block_size
-                if isinstance(layer_spec, MambaSpec)
-                else layer_spec.block_size // self._physical_blocks_per_logical_kv_block
-            )
-            self.region_block_sizes.append(region_block_size)
-            self.region_names.append(transfer_layer_name(layer_name))
-            self.region_num_blocks.append(num_blocks)
-            self._region_is_mla.append(is_mla_region)
-            if self._nixl_adapter is not None:
-                self._nixl_adapter.register_region(
-                    layer_name, group, region_block_len, kv_caches
+            storage = cache.untyped_storage()
+            storage_addr = storage.data_ptr()
+            tensor_config = tensor_configs.get(layer_name)
+            is_host_resident = tensor_config is not None and tensor_config.host_resident
+            if cache.device.type == "cpu":
+                mem_type = "DRAM"
+                region_device_id = 0
+            else:
+                mem_type = self.nixl_memory_type
+                region_device_id = max(cache.get_device(), 0)
+                self.device_id = region_device_id
+            if is_host_resident:
+                registration_base = cache.data_ptr()
+                registration_len = cache.nbytes
+            else:
+                registration_base = storage_addr
+                registration_len = storage.nbytes()
+            storage_key = (registration_base, mem_type)
+            if storage_key not in registration_ranges:
+                registration_ranges[storage_key] = (
+                    registration_base,
+                    registration_base + registration_len,
+                    region_device_id,
                 )
+
+            if isinstance(layer_spec, MambaSpec):
+                region_specs = [
+                    (
+                        cache.data_ptr(),
+                        physical_page_size
+                        // self._physical_blocks_per_logical_kv_block,
+                        physical_page_size
+                        // self._physical_blocks_per_logical_kv_block,
+                    )
+                ]
+            else:
+                if cache.ndim == 1:
+                    # Flat byte view: HMA tensors shared between layer types carry
+                    # no block dimension, so stride(0) is 1 byte. Blocks abut, so
+                    # the stride is the page size.
+                    block_stride = physical_page_size
+                else:
+                    block_stride = cache.stride(0) * cache.element_size()
+                storage_is_block_major = num_blocks * block_stride == registration_len
+                # A layer whose [H, N, C] interior is dense addresses its own page
+                # as one chunk, so it can own a region. When it does not, or when
+                # every layer is packed into this one storage, the block's whole
+                # row is the only contiguous unit.
+                hnc_contiguous = (
+                    cache.ndim == 4
+                    and cache.stride(2) == cache.shape[3]
+                    and cache.stride(1) == cache.shape[2] * cache.shape[3]
+                )
+                if storage_is_block_major and (
+                    (packed_storage and is_mla_region) or not hnc_contiguous
+                ):
+                    # TODO(Lucas): handle TP slicing for packed_storage; for now
+                    # restrict to MLA (DSv4) where kv is replicated.
+                    storage_block_len = registration_len // num_blocks
+                    region_specs = [
+                        (registration_base, storage_block_len, storage_block_len)
+                    ]
+                elif storage_is_block_major:
+                    region_specs = [
+                        (cache.data_ptr(), physical_page_size, block_stride)
+                    ]
+                else:
+                    segment_bytes = num_blocks * block_stride
+                    assert cache.nbytes % segment_bytes == 0
+                    num_segments = cache.nbytes // segment_bytes
+                    region_block_len = (
+                        block_stride if num_segments > 1 else physical_page_size
+                    )
+                    region_specs = [
+                        (
+                            cache.data_ptr() + segment_idx * segment_bytes,
+                            region_block_len,
+                            block_stride,
+                        )
+                        for segment_idx in range(num_segments)
+                    ]
+
+            for base_addr, block_len, block_stride in region_specs:
+                if base_addr in seen_base_addresses:
+                    idx = seen_base_addresses.index(base_addr)
+                    if is_mla_region:
+                        # Dual-purpose HMA tensor: an MLA layer shares a region
+                        # that a non-MLA layer registered first. MLA is not
+                        # head-sharded, so the region must be flagged MLA.
+                        self._region_is_mla[idx] = True
+                    if self.region_group_ids[idx] != group_id:
+                        self.region_group_ids[idx] = _SHARED_REGION_GROUP_ID
+                    continue
+                seen_base_addresses.append(base_addr)
+                self.block_len_per_layer.append(block_len)
+                self.block_stride_per_layer.append(block_stride)
+                self.region_strides.append(block_stride)
+                self.region_group_ids.append(group_id)
+                self.region_block_sizes.append(
+                    layer_spec.block_size
+                    if isinstance(layer_spec, MambaSpec)
+                    else layer_spec.block_size
+                    // self._physical_blocks_per_logical_kv_block
+                )
+                self.region_names.append(transfer_layer_name(layer_name))
+                self.region_num_blocks.append(num_blocks)
+                self._region_is_mla.append(is_mla_region)
+                region_mem_types.append(mem_type)
+                if self._nixl_adapter is not None:
+                    self._nixl_adapter.register_region(
+                        layer_name, group, block_len, kv_caches
+                    )
 
             # When there's a mismatch between kbs<>bs, we rely on HMA to ensure
             # caches are either [NB, PS] or [NB*r, PS/r] where r is bs/kbs.
@@ -1342,38 +1326,6 @@ class NixlBaseConnectorWorker:
                     f"kv_cache_layout={self.kv_cache_layout}"
                 )
 
-            # Need to make sure the device ID is non-negative for NIXL,
-            # Torch uses -1 to indicate CPU tensors.
-            if cache.device.type == "cpu":
-                mem_type = "DRAM"
-                region_device_id = 0
-            else:
-                mem_type = self.nixl_memory_type
-                region_device_id = max(cache.get_device(), 0)
-                self.device_id = region_device_id
-            region_mem_types.append(mem_type)
-            storage = cache.untyped_storage()
-            storage_key = (storage.data_ptr(), mem_type)
-            region_end = (
-                base_addr
-                + (num_blocks - 1) * self.region_strides[-1]
-                + self.block_len_per_layer[-1]
-            )
-            if storage_key in registration_ranges:
-                start, end, device_id = registration_ranges[storage_key]
-                assert device_id == region_device_id
-                registration_ranges[storage_key] = (
-                    min(start, base_addr),
-                    max(end, region_end),
-                    device_id,
-                )
-            else:
-                registration_ranges[storage_key] = (
-                    base_addr,
-                    region_end,
-                    region_device_id,
-                )
-
         logger.debug(
             "Different block lengths collected: %s", set(self.block_len_per_layer)
         )
@@ -1381,6 +1333,7 @@ class NixlBaseConnectorWorker:
             len(self.block_len_per_layer)
             == len(seen_base_addresses)
             == len(self._region_is_mla)
+            == len(self.block_stride_per_layer)
             == len(self.region_strides)
             == len(self.region_group_ids)
             == len(self.region_block_sizes)
@@ -1413,9 +1366,6 @@ class NixlBaseConnectorWorker:
             assert self.use_mla and not self._has_mamba, (
                 "Mixed-device KV registration is only supported for MLA "
                 "models without Mamba layers."
-            )
-            assert not self.transfer_topo.virtually_split_kv_in_blocks, (
-                "Mixed-device KV registration does not support blocks-first KV layouts."
             )
         for mem_type in sorted(set(region_mem_types)):
             typed = [
@@ -1465,6 +1415,7 @@ class NixlBaseConnectorWorker:
             kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id][self.tp_rank],
             num_blocks=self.num_blocks,
             block_lens=self.block_len_per_layer,
+            block_strides=self.block_stride_per_layer,
             kv_cache_layout=self.kv_cache_layout
             if not self.use_host_buffer
             else self.host_buffer_kv_cache_layout,
@@ -1479,6 +1430,8 @@ class NixlBaseConnectorWorker:
             region_group_ids=self.region_group_ids,
             region_block_sizes=self.region_block_sizes,
             region_names=self.region_names,
+            dcp_size=self.dcp_size,
+            pcp_size=self.pcp_size,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1811,7 +1764,7 @@ class NixlBaseConnectorWorker:
                                                  tp_ratio = 4 // 2 = 2
 
         Considering the KV Caches, if P-Worker_i has cache size [2, num_blocksP, kv_heads, block_size, head_dim]
-        then D-Worker_j has [2, num_blocksD, kv_heads//tp_ratio, block_size, head_dim]. Mind the "HND" layout format.
+        then D-Worker_j has [2, num_blocksD, kv_heads//tp_ratio, block_size, head_dim]. Mind the "LBHNC" layout format.
         Assuming num_blocksD >= num_blocksP, D-Worker0 reads from P-Worker0 by preparing the kv_heads//tp_ratio
         first heads from all the slots of all the blocks. D-Worker1 will do the same, but reading the second split
         along the kv_heads dimension, and so forth until "tp_ratio" D TP workers have pulled from P-Worker0.
@@ -1851,6 +1804,7 @@ class NixlBaseConnectorWorker:
                 start:end
             ]
             nixl_agent_meta.block_lens = nixl_agent_meta.block_lens[start:end]
+            nixl_agent_meta.block_strides = nixl_agent_meta.block_strides[start:end]
             if nixl_agent_meta.region_strides is not None:
                 nixl_agent_meta.region_strides = nixl_agent_meta.region_strides[
                     start:end
@@ -2107,10 +2061,10 @@ class NixlBaseConnectorWorker:
         if not self.use_mla and nixl_agent_meta.kv_cache_layout != kv_cache_layout:
             if (
                 self.kv_transfer_config.enable_permute_local_kv
-                and nixl_agent_meta.kv_cache_layout == "HND"
+                and nixl_agent_meta.kv_cache_layout == "LBHNC"
             ):
                 logger.info(
-                    "Remote is HND and local is NHD, enabled additional permute "
+                    "Remote is LBHNC and local is LBNHC, enabled additional permute "
                     "on local device KV."
                 )
                 assert not self._is_hma_required, (
@@ -2140,18 +2094,18 @@ class NixlBaseConnectorWorker:
             self.enable_heterogeneous_attn_post_process = True
 
         # Heterogeneous TP requires head-splitting, which only works with
-        # HND layout. MLA and replicated-KV cases don't split on heads.
-        # Mamba doesn't support heterogeneous TP.
+        # block-contiguous layouts (e.g. LBHNC). MLA and replicated-KV cases
+        # don't split on heads. Mamba doesn't support heterogeneous TP.
         if (
             abs(tp_ratio) != 1
             and not self.use_mla
             and not self.transfer_topo.is_kv_replicated(remote_engine_id)
-            and kv_cache_layout != "HND"
+            and not KVCacheLayout[kv_cache_layout].is_block_contiguous
             and not self.enable_permute_local_kv
         ):
             raise RuntimeError(
                 "Heterogeneous TP head-dimension splitting requires contiguous heads. "
-                "Use HND layout on the prefill side."
+                "Use a block-contiguous layout (e.g. LBHNC) on the prefill side."
             )
 
         # Per-region block_len validation enforcing the P/D invariant.

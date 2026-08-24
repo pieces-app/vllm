@@ -119,75 +119,8 @@ def test_local_descriptors_follow_each_region_pool_capacity():
 
 
 @pytest.mark.cpu_test
-def test_packed_cache_initializes_descriptor_region_metadata():
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
-        NixlConnectorWorker,
-    )
-
-    worker = object.__new__(NixlConnectorWorker)
-    worker.tp_rank = 0
-    worker.world_size = 1
-    worker.block_size = 256
-    worker.engine_id = "local-engine"
-    worker.use_mla = True
-    worker.model_config = MagicMock()
-    worker.model_config.get_total_num_kv_heads.return_value = 1
-    worker.attn_backends = []
-    worker._has_mamba = False
-    worker.vllm_config = MagicMock()
-    worker.backend_name = "FLASHMLA"
-    worker.num_blocks = 4
-    worker.nixl_memory_type = "VRAM"
-    worker.nixl_backends = None
-    worker.nixl_wrapper = MagicMock()
-    worker.nixl_wrapper.get_reg_descs.side_effect = lambda data, _: data
-    worker.nixl_wrapper.get_xfer_descs.side_effect = lambda data, _: data
-    worker.nixl_wrapper.prep_xfer_dlist.return_value = 7
-    worker.nixl_wrapper.get_agent_metadata.return_value = b"metadata"
-    worker._registered_descs = []
-    worker.dst_num_blocks = {}
-    worker.dst_region_num_blocks = {}
-    worker.dst_region_group_ids = {}
-    worker.dst_region_block_sizes = {}
-    worker.dst_region_split_ratios = {}
-    worker.src_xfer_handles_by_block_size = {}
-    worker.kv_caches_base_addr = defaultdict(dict)
-    worker._mamba_ssm_size = (0, 0)
-    worker.kv_cache_layout = "NHD"
-    worker._physical_blocks_per_logical_kv_block = 1
-    worker.region_mem_types = []
-    worker.region_strides = []
-    worker.region_group_ids = []
-    worker.region_block_sizes = []
-    worker.region_names = []
-    worker.region_num_blocks = []
-    worker._mixed_mem_types = False
-    worker._region_is_mla = []
-
-    storage = MagicMock()
-    storage.nbytes.return_value = 4096
-    storage.data_ptr.return_value = 0x1000
-    storage.device.index = 0
-    transfer_topology = MagicMock()
-    transfer_topology.cross_layers_blocks = False
-
-    with (
-        patch.object(bw, "TransferTopology", return_value=transfer_topology),
-        patch.object(bw, "compute_nixl_compatibility_hash", return_value="hash"),
-    ):
-        worker._register_packed_kv_cache(storage)
-
-    assert worker.region_strides == [1024]
-    assert worker.region_num_blocks == [4]
-    assert worker._region_is_mla == [True]
-    assert worker.src_xfer_handles_by_block_size[256] == 7
-    assert worker.src_blocks_data[:, 1].tolist() == [1024] * 4
-
-
-@pytest.mark.cpu_test
-def test_overlaid_transfer_groups_keep_independent_regions():
-    """Shared storage registration must not merge distinct block tables."""
+def test_overlaid_transfer_groups_share_region_geometry():
+    """Groups overlaid on one allocation share its transfer region."""
     import msgspec
 
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
@@ -205,7 +138,6 @@ def test_overlaid_transfer_groups_keep_independent_regions():
     )
 
     num_blocks = 4
-    allocated_blocks = 6
     spec = MLAAttentionSpec(
         block_size=4,
         num_kv_heads=1,
@@ -214,7 +146,7 @@ def test_overlaid_transfer_groups_keep_independent_regions():
     )
     page_size = spec.page_size_bytes
     block_stride = 2 * page_size
-    backing = torch.zeros(allocated_blocks, block_stride, dtype=torch.uint8)
+    backing = torch.zeros(num_blocks, block_stride, dtype=torch.uint8)
     caches = {
         "layer.0": backing[:, :page_size],
         "layer.1": backing[:, :page_size],
@@ -262,27 +194,33 @@ def test_overlaid_transfer_groups_keep_independent_regions():
     worker._dram_src_handles_by_block_size = {}
     worker._region_is_mla = []
     worker.block_len_per_layer = []
+    worker.block_stride_per_layer = []
     worker.device_id = 0
     worker.use_host_buffer = False
     worker.host_xfer_buffers = {}
     worker.device_kv_caches = {}
     worker.pp_size = 1
+    worker.dcp_size = 1
+    worker.pcp_size = 1
     worker.kv_buffer_device = "cuda"
     worker._layer_specs = {name: spec for name in caches}
     worker._nixl_adapter = None
     worker.kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[
-            KVCacheTensor(size=backing.nbytes, shared_by=[name]) for name in caches
+            KVCacheTensor(
+                size=backing.nbytes,
+                layers=[name],
+                layer_stride=page_size,
+                block_stride=block_stride,
+            )
+            for name in caches
         ],
         kv_cache_groups=groups,
         num_blocks_by_pool=[num_blocks],
     )
 
     transfer_topology = MagicMock()
-    transfer_topology.cross_layers_blocks = False
-    transfer_topology._cross_layers_blocks = False
-    transfer_topology.virtually_split_kv_in_blocks = False
 
     with (
         patch.object(bw, "TransferTopology", return_value=transfer_topology),
@@ -290,20 +228,13 @@ def test_overlaid_transfer_groups_keep_independent_regions():
     ):
         worker.register_kv_caches(caches)
 
-    assert worker.region_group_ids == [0, 1]
-    assert worker.region_strides == [block_stride, block_stride]
+    assert worker.region_group_ids == [-1]
+    assert worker.region_strides == [block_stride]
     assert worker.nixl_wrapper.registered[0][0] == [
-        (
-            backing.data_ptr(),
-            (num_blocks - 1) * block_stride + page_size,
-            0,
-            "",
-        )
+        (backing.data_ptr(), backing.nbytes, 0, "")
     ]
     expected_addrs = [
-        caches[layer].data_ptr() + block * block_stride
-        for layer in caches
-        for block in range(num_blocks)
+        backing.data_ptr() + block * block_stride for block in range(num_blocks)
     ]
     assert worker.src_blocks_data[:, 0].tolist() == expected_addrs
 
@@ -311,8 +242,8 @@ def test_overlaid_transfer_groups_keep_independent_regions():
         worker.xfer_handshake_metadata.agent_metadata_bytes,
         type=NixlAgentMetadata,
     )
-    assert metadata.region_group_ids == [0, 1]
-    assert metadata.region_num_blocks == [num_blocks, num_blocks]
+    assert metadata.region_group_ids == [-1]
+    assert metadata.region_num_blocks == [num_blocks]
 
 
 def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blocks):
@@ -346,14 +277,19 @@ def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blo
         page_size_padded=unified_page,
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     )
+    # The three groups overlay each other, so layer i of every group aliases the same
+    # region: mla.i, kda_a.i and kda_b.i all live at i * layer_stride.
+    layer_stride = num_logical_blocks * unified_page
     kv_cache_config = KVCacheConfig(
         num_blocks=num_logical_blocks,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=num_logical_blocks * unified_page,
-                shared_by=[f"mla.{i}", f"kda_a.{i}", f"kda_b.{i}"],
+                size=2 * layer_stride,
+                layers=[f"{prefix}.0", f"{prefix}.1"],
+                layer_stride=layer_stride,
+                block_stride=unified_page,
             )
-            for i in range(2)
+            for prefix in ("mla", "kda_a", "kda_b")
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(["mla.0", "mla.1"], mla_spec),
@@ -445,6 +381,8 @@ def _make_remote_meta(
         kv_caches_base_addr=[0x10_000_000, 0x20_000_000],
         num_blocks=remote_num_logical * remote_ppl,
         block_lens=[kernel_page, kernel_page],
+        # Non-interleaved remote: consecutive blocks abut, so stride == page length.
+        block_strides=[kernel_page, kernel_page],
         kv_cache_layout=worker.kv_cache_layout,
         block_size=remote_kernel_block_size,
         ssm_sizes=remote_ssm_sizes,

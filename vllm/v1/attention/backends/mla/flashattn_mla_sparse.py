@@ -23,6 +23,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    flat_kv_row_view,
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -101,16 +102,6 @@ class FlashAttnMLASparseBackend(AttentionBackend):
             if not hasattr(hf_config, "index_topk"):
                 return "FlashAttention MLA Sparse requires model with index_topk"
         return None
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
 
 
 @dataclass
@@ -212,12 +203,17 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
         )
         if hisparse_resolution is not None:
             kv_c_and_k_pe_cache, topk_indices, valid_counts = hisparse_resolution
+            kv_rows, _ = flat_kv_row_view(kv_c_and_k_pe_cache, attn_metadata.block_size)
         else:
+            kv_rows, block_stride_rows = flat_kv_row_view(
+                kv_c_and_k_pe_cache, attn_metadata.block_size
+            )
             topk_indices, valid_counts = triton_convert_req_index_to_global_index(
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 attn_metadata.block_table,
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
+                BLOCK_STRIDE_ROWS=block_stride_rows,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
             )
@@ -225,13 +221,8 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
         cu_seqlens_q = torch.arange(
             0, num_actual_toks + 1, dtype=torch.int32, device=q_rope.device
         )
-        kv_cache = kv_c_and_k_pe_cache.view(
-            -1, attn_metadata.block_size, self.head_size
-        )
-        k_cache = kv_cache[:, :, self.kv_lora_rank :].view(
-            -1, 1, 1, self.qk_rope_head_dim
-        )
-        v_cache = kv_cache[:, :, : self.kv_lora_rank].view(-1, 1, 1, self.kv_lora_rank)
+        k_cache = kv_rows[:, self.kv_lora_rank :].unsqueeze(1).unsqueeze(1)
+        v_cache = kv_rows[:, : self.kv_lora_rank].unsqueeze(1).unsqueeze(1)
 
         out = flash_attn_varlen_func(
             q=q_rope,
