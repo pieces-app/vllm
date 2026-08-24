@@ -548,7 +548,7 @@ def make_kv_cache_config_hybrid_model(
     elif second_spec_type == "mamba":
         second_spec = MambaSpec(
             block_size=block_size,
-            shapes=(1, 1),
+            shapes=((1, 1),),
             dtypes=(torch.float32,),
         )
 
@@ -583,7 +583,7 @@ def make_kv_cache_config_three_types(
     if third_spec_type == "mamba":
         third_spec = MambaSpec(
             block_size=block_size,
-            shapes=(1, 1),
+            shapes=((1, 1),),
             dtypes=(torch.float32,),
         )
     elif third_spec_type == "sliding_window":
@@ -1162,12 +1162,12 @@ def _make_hybrid_kv_cache_config(
         ),
         "mamba": lambda: MambaSpec(
             block_size=block_size,
-            shapes=(1, 1),
+            shapes=((1, 1),),
             dtypes=(torch.float32,),
         ),
         "mamba_align": lambda: MambaSpec(
             block_size=block_size,
-            shapes=(1, 1),
+            shapes=((1, 1),),
             dtypes=(torch.float32,),
             mamba_cache_mode="align",
         ),
@@ -1483,6 +1483,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         use_eagle=False,
         hash_block_size=block_size,
         mamba_partial_cache_hit=False,
+        mamba_has_prefill_checkpoint_blocks=False,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(
@@ -3667,7 +3668,7 @@ def test_hybrid_local_kv_retention_interval_survives_recycling():
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.uint8,
-                    compress_ratio=4,
+                    tokens_per_state=4,
                 ),
             ),
             KVCacheGroupSpec(
