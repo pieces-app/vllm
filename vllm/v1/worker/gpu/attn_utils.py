@@ -245,7 +245,11 @@ def _allocate_hisparse_kv_cache(
             spec = group.kv_cache_spec
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = spec.kv_cache_specs[layer_name]
-            layer_tensor = replace(tensor, layers=[layer_name], layer_stride=0)
+            layer_tensor = replace(
+                tensor,
+                layers=[layer_name],
+                layer_stride=tensor.layer_stride or tensor.size,
+            )
             (kv_cache,) = create_kv_cache_views(
                 backing,
                 spec,
