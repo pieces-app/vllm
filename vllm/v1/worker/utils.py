@@ -647,7 +647,10 @@ def copy_kv_cache_blocks_inplace(
     if not kv_cache_block_copies:
         return
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    indices_np = np.array(
+        [(copy.src_block_id, copy.dst_block_id) for copy in kv_cache_block_copies],
+        dtype=np.int64,
+    )
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
