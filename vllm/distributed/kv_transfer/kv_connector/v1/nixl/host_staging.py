@@ -9,10 +9,9 @@ destination. Requests complete only after every chunk reaches host memory.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
-import threading
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,7 +23,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _CUDA_MEMCPY_DEVICE_TO_HOST = 2
-_SHUTDOWN_TIMEOUT_S = 2.0
 _SHUTDOWN_POLL_INTERVAL_S = 0.001
 
 
@@ -76,29 +74,49 @@ class _Pool:
         self.reg_descs = nixl_wrapper.get_reg_descs(
             [(base, self.buffer.numel(), device_id, "")], memory_type
         )
-        nixl_wrapper.register_memory(self.reg_descs, backends=backends)
-        blocks = [
-            (base + i * desc_len, desc_len, device_id) for i in range(total_descs)
-        ]
-        descs = nixl_wrapper.get_xfer_descs(blocks, memory_type)
-        self.handle = nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
-        self.stage_ptrs = np.array(
-            [base + i * desc_len for i in range(total_descs)], dtype=np.uint64
-        )
-        self.slots = [
-            _Slot(
-                pool=self,
-                event=torch.cuda.Event(),
-                desc_ids=np.arange(
-                    s * self.descs_per_slot,
-                    (s + 1) * self.descs_per_slot,
-                    dtype=np.int64,
-                ),
+        handle = None
+        try:
+            nixl_wrapper.register_memory(self.reg_descs, backends=backends)
+            blocks = [
+                (base + i * desc_len, desc_len, device_id) for i in range(total_descs)
+            ]
+            descs = nixl_wrapper.get_xfer_descs(blocks, memory_type)
+            handle = nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+            self.stage_ptrs = np.array(
+                [base + i * desc_len for i in range(total_descs)], dtype=np.uint64
             )
-            for s in range(num_slots)
-        ]
+            self.slots = [
+                _Slot(
+                    pool=self,
+                    event=torch.cuda.Event(),
+                    desc_ids=np.arange(
+                        s * self.descs_per_slot,
+                        (s + 1) * self.descs_per_slot,
+                        dtype=np.int64,
+                    ),
+                )
+                for s in range(num_slots)
+            ]
+        except Exception:
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    nixl_wrapper.release_dlist_handle(handle)
+            with contextlib.suppress(Exception):
+                nixl_wrapper.deregister_memory(self.reg_descs)
+            raise
+        self.handle = handle
         self.free_slots = list(self.slots)
         self.bytes = total_descs * desc_len
+        self._handle_released = False
+        self._memory_deregistered = False
+
+    def close(self) -> None:
+        if not self._handle_released:
+            self.nixl_wrapper.release_dlist_handle(self.handle)
+            self._handle_released = True
+        if not self._memory_deregistered:
+            self.nixl_wrapper.deregister_memory(self.reg_descs)
+            self._memory_deregistered = True
 
 
 @dataclass
@@ -153,22 +171,26 @@ class HostWriteStager:
 
         lengths = sorted({int(x) for x in np.unique(desc_lens)})
         per_pool_bytes = max(stage_bytes // len(lengths), 1)
-        self._pools: dict[int, _Pool] = {
-            length: _Pool(
-                desc_len=length,
-                device=device,
-                nixl_wrapper=nixl_wrapper,
-                memory_type=memory_type,
-                backends=backends,
-                stage_bytes=per_pool_bytes,
-                num_slots=num_slots,
-            )
-            for length in lengths
-        }
-        self._copy_stream = torch.cuda.Stream(device=device)
+        self._pools: dict[int, _Pool] = {}
+        try:
+            for length in lengths:
+                self._pools[length] = _Pool(
+                    desc_len=length,
+                    device=device,
+                    nixl_wrapper=nixl_wrapper,
+                    memory_type=memory_type,
+                    backends=backends,
+                    stage_bytes=per_pool_bytes,
+                    num_slots=num_slots,
+                )
+            self._copy_stream = torch.cuda.Stream(device=device)
+        except Exception:
+            for pool in self._pools.values():
+                with contextlib.suppress(Exception):
+                    pool.close()
+            raise
         self._reqs: dict[str, _ReqState] = {}
         self._closed = False
-        self._shutdown_thread: threading.Thread | None = None
 
         logger.info(
             "NIXL host write staging enabled: %.2f GiB device staging across "
@@ -178,10 +200,6 @@ class HostWriteStager:
             lengths,
             num_slots,
         )
-
-    @property
-    def active_req_ids(self) -> set[str]:
-        return set(self._reqs)
 
     def submit(
         self,
@@ -264,8 +282,8 @@ class HostWriteStager:
             finally:
                 slot.event.record(stream)
 
-    def advance(self) -> tuple[set[str], set[str]]:
-        """Drive the pipeline. Returns (fully staged req_ids, failed req_ids)."""
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        """Return successfully and unsuccessfully completed request IDs."""
         done: set[str] = set()
         failed: set[str] = set()
         for req_id, state in list(self._reqs.items()):
@@ -366,60 +384,17 @@ class HostWriteStager:
                     else:
                         slot.pool.free_slots.append(slot)
                 state.reading = still_reading
-        self.advance()
+        self.get_finished()
         if self._reqs:
             return False
         self._copy_stream.synchronize()
         for pool in self._pools.values():
-            self.nixl_wrapper.release_dlist_handle(pool.handle)
-            self.nixl_wrapper.deregister_memory(pool.reg_descs)
+            pool.close()
         self._closed = True
         return True
 
-    def _reap_shutdown(self, on_complete: Callable[[], None] | None) -> None:
-        try:
-            while not self._poll_shutdown(cancel=True):
-                time.sleep(_SHUTDOWN_POLL_INTERVAL_S)
-            if on_complete is not None:
-                on_complete()
-            logger.info("Deferred NIXL host-staging cleanup completed.")
-        finally:
-            self._shutdown_thread = None
-
-    def shutdown(
-        self,
-        drain_timeout: float | None = None,
-        on_complete: Callable[[], None] | None = None,
-    ) -> bool:
-        """Bound shutdown and defer cleanup while transfers remain active."""
-        if self._shutdown_thread is not None:
-            return False
-        if self._closed:
-            return True
-        if drain_timeout is None:
-            drain_timeout = _SHUTDOWN_TIMEOUT_S
-
+    def shutdown(self) -> None:
+        """Abort active requests and block until staging resources are safe."""
         self._begin_shutdown()
-        deadline = time.monotonic() + drain_timeout
-        drained = self._poll_shutdown()
-        while not drained and time.monotonic() < deadline:
+        while not self._poll_shutdown(cancel=True):
             time.sleep(_SHUTDOWN_POLL_INTERVAL_S)
-            drained = self._poll_shutdown()
-        if not drained:
-            drained = self._poll_shutdown(cancel=True)
-        if drained:
-            return True
-
-        logger.warning(
-            "NIXL host-staging shutdown timed out after %.1fs; retaining "
-            "registered memory until active operations become terminal.",
-            drain_timeout,
-        )
-        self._shutdown_thread = threading.Thread(
-            target=self._reap_shutdown,
-            args=(on_complete,),
-            name="vllm-nixl-host-staging-shutdown",
-            daemon=True,
-        )
-        self._shutdown_thread.start()
-        return False
