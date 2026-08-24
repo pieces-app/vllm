@@ -476,7 +476,7 @@ def init_hisparse_worker(
     tensor_configs = {
         name: tensor_config
         for tensor_config in kv_cache_config.kv_cache_tensors
-        for name in tensor_config.shared_by
+        for name in tensor_config.layers
     }
     groups = kv_cache_config.kv_cache_groups
     source_group_id = get_unique_kv_cache_group_id(
@@ -501,8 +501,8 @@ def init_hisparse_worker(
         source_spec = source_specs.kv_cache_specs[cache_name]
         gpu_indexer_spec = indexer_specs.kv_cache_specs[layer_name]
         assert isinstance(source_spec, AttentionSpec)
-        kernel_block_size = gpu_indexer_spec.storage_block_size
-        source_block_size = source_spec.storage_block_size
+        kernel_block_size = gpu_indexer_spec.num_states
+        source_block_size = source_spec.num_states
         assert source_block_size % kernel_block_size == 0
         blocks_per_kv_block = source_block_size // kernel_block_size
         kernel_page_stride = (

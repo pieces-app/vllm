@@ -63,7 +63,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.stats import HiSparseStats
 from vllm.v1.outputs import (
     DraftTokenIds,
@@ -71,7 +71,6 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
     RoutedExpertsTensors,
-    make_empty_encoder_model_runner_output,
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -96,6 +95,9 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+)
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    profile_cudagraph_memory as _profile_cudagraph_memory,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
@@ -178,7 +180,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.device = device
         self.dtype = self.model_config.dtype
-        self.is_encoder_only = vllm_config.is_encoder_only
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
             # Quantized KV cache.
@@ -502,11 +503,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return encoder_runner.get_encoder_timing_stats()
 
     def get_kv_cache_spec(self):
-        if self.is_encoder_only:
-            return {}
         return get_kv_cache_spec(self.vllm_config)
 
-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+    def initialize_kv_cache(
+        self, kv_cache_config: KVCacheConfig, is_profiling: bool = False
+    ) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
@@ -591,6 +592,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tensor_parallel_size=self.parallel_config.tensor_parallel_size,
             kv_cache_config=self.kv_cache_config,
             max_num_reqs=self.max_num_reqs,
+            is_profiling=is_profiling,
         )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
@@ -620,9 +622,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
-            self.attn_groups,
             self.device,
-            self.cache_config.cache_dtype,
             self.kernel_block_sizes,
             self.vllm_config,
             self.block_tables,
@@ -630,9 +630,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.device_kv_cache_block_copier = DeviceKVCacheBlockCopier(
             self.kv_cache_config, kv_caches_dict
         )
-        self.kv_connector = get_kv_connector(
-            self.vllm_config, kv_caches_dict, kv_cache_runtime
-        )
+        if is_profiling:
+            self.kv_connector = NO_OP_KV_CONNECTOR
+        else:
+            self.kv_connector = get_kv_connector(
+                self.vllm_config, kv_caches_dict, kv_cache_runtime
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -640,7 +643,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             attn_groups=self.attn_groups,
             kernel_block_sizes=self.kernel_block_sizes,
-            cache_dtype=self.cache_config.cache_dtype,
             static_forward_context=self.compilation_config.static_forward_context,
             kv_cache_config=self.kv_cache_config,
         )
@@ -658,9 +660,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if self.is_encoder_only:
-            empty = torch.empty(0, device=self.device)
-            return empty, empty
         if skip_attn and not is_profile:
             raise ValueError(
                 "skip_attn must only be True for initial memory profiling."
@@ -821,12 +820,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_mm_inputs, mm_budget
                 )
 
-        if self.is_encoder_only:
-            torch.accelerator.synchronize()
-            self.reset_encoder_cache()
-            gc.collect()
-            return
-
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -857,15 +850,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pooling_runner is not None:
             self.pooling_runner.clear()
 
+    @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
-        # NOTE(woosuk): It is TBD whether we keep this API or not.
-        return 0
+        """Estimate the GPU memory required to capture CUDA graphs."""
+        return _profile_cudagraph_memory(self)
 
     @torch.inference_mode()
     def capture_model(self) -> int:
-        if self.is_encoder_only:
-            return 0
-
         assert self.cudagraph_manager is not None
         capture_encoder = (
             self.model_state.supports_mm_inputs
@@ -1552,12 +1543,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mappings, self.kv_cache_config
             )
             assert block_tables is not None
+            attn_groups = self.attn_groups
+            if dummy_run and is_profile:
+                # Mamba layers take a cheap warmup path with no metadata;
+                # attention metadata is still built so those kernels tune.
+                attn_groups = [
+                    [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
+                    for groups in attn_groups
+                ]
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
                 block_tables,
                 slot_mappings,
-                self.attn_groups,
+                attn_groups,
                 self.kv_cache_config,
                 # FULL replay reads capture-time metadata buffers. Re-stage them
                 # from the zeroed dummy block tables instead of retaining state
@@ -1590,25 +1589,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 with self.ec_connector.maybe_get_output(
                     scheduler_output
                 ) as ec_connector_output:
-                    if self.is_encoder_only:
-                        # Encode and publish, nothing else: this instance runs no
-                        # language model, so the gather inside prepare_inputs_embeds
-                        # would build an inputs_embeds nobody reads -- and it
-                        # raises "Encoder cache miss" for any scheduled item this
-                        # instance did not encode, taking the engine down with it.
-                        self.model_state.execute_mm_encoder(scheduled_encoder_inputs)
-                    else:
-                        inputs_embeds = self.model_state.prepare_inputs_embeds(
-                            scheduled_encoder_inputs, input_batch, self.req_states
-                        )
+                    inputs_embeds = self.model_state.prepare_inputs_embeds(
+                        scheduled_encoder_inputs, input_batch, self.req_states
+                    )
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
-
-        if self.is_encoder_only:
-            return ModelRunnerOutput.with_ec_conn_output(
-                make_empty_encoder_model_runner_output(scheduler_output),
-                ec_connector_output,
-            )
 
         model_inputs = {
             "input_ids": input_ids,
