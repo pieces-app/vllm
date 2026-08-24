@@ -1435,23 +1435,12 @@ def _get_hisparse_hma_config(
     group = groups[0]
     assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
     all_full_specs = group.kv_cache_spec.kv_cache_specs
-    is_deepseek_v4 = any(
+    if any(
         isinstance(spec, MLAAttentionSpec) and spec.model_version == "deepseek_v4"
         for spec in all_full_specs.values()
-    )
-    specs: dict[str, KVCacheSpec]
-    if is_deepseek_v4:
-        specs = {
-            name: spec
-            for name, spec in all_full_specs.items()
-            if isinstance(spec, MLAAttentionSpec) and spec.compress_ratio == 4
-        }
-        if not specs:
-            raise ValueError(
-                "HiSparse requires DeepSeek V4 to expose C4 MLA cache layers."
-            )
-    else:
-        specs = all_full_specs
+    ):
+        raise ValueError("HiSparse does not support DeepSeek V4.")
+    specs = all_full_specs
     host_specs = {
         name: spec
         for name, spec in specs.items()
@@ -1734,22 +1723,16 @@ def _hisparse_gpu_memory_usage(
     ):
         return None
     per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-    is_deepseek_v4 = any(
+    if any(
         isinstance(spec, MLAAttentionSpec) and spec.model_version == "deepseek_v4"
         for spec in per_layer_specs.values()
-    )
+    ):
+        raise ValueError("HiSparse does not support DeepSeek V4.")
     full_group_bytes = sum(
         spec.max_memory_usage_bytes(vllm_config)
         for spec in per_layer_specs.values()
-        if (
-            isinstance(spec, MLAAttentionSpec)
-            and spec.cache_role is SparseCacheRole.INDEXER
-        )
-        or (
-            is_deepseek_v4
-            and isinstance(spec, MLAAttentionSpec)
-            and spec.compress_ratio != 4
-        )
+        if isinstance(spec, MLAAttentionSpec)
+        and spec.cache_role is SparseCacheRole.INDEXER
     )
     return full_group_bytes + sum(
         group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
