@@ -374,6 +374,7 @@ class HiSparseRuntime:
         kv_dtype: torch.dtype,
         device: torch.device | str,
         storage_block_size: int | None = None,
+        row_value_bytes: int | None = None,
         max_swap_rows: int | None = None,
         index_group: HiSparseIndexGroup | None = None,
     ) -> None:
@@ -389,14 +390,20 @@ class HiSparseRuntime:
         self.kv_dtype = kv_dtype
         self.device = torch.device(device)
         self.storage_block_size = storage_block_size
+        self.row_value_bytes = row_value_bytes
         # Logical slots per request. Physical rows come from its ephemeral HMA
         # block table and need not be contiguous in the shared slab.
         self.region_stride = config.device_buffer_size
 
         row_bytes = row_width * kv_dtype.itemsize
-        if row_bytes % 16 != 0:
+        if row_value_bytes is None and row_bytes % 16 != 0:
             raise ValueError(
                 f"HiSparse requires 16-byte aligned KV rows, got {row_bytes}B."
+            )
+        if row_value_bytes is not None and not 0 < row_value_bytes < row_bytes:
+            raise ValueError(
+                "HiSparse split-page value bytes must be between zero and the "
+                f"full row width, got {row_value_bytes} for a {row_bytes}B row."
             )
 
         self._prefetch_event: torch.Event | None = None
@@ -469,7 +476,11 @@ class HiSparseRuntime:
         if not (kv_cache.is_pinned() or explicitly_registered):
             raise ValueError("HiSparse host-resident KV pool must be pinned memory.")
 
-        self._host_cache = kv_cache.view(-1, kv_cache.shape[-1])
+        self._host_cache = (
+            kv_cache
+            if self.row_value_bytes is not None
+            else kv_cache.view(-1, kv_cache.shape[-1])
+        )
 
     def stage_prefill_cache(
         self,
@@ -509,7 +520,7 @@ class HiSparseRuntime:
             device=plan.block_table.device,
         )
         torch.ops._C_cache_ops.hisparse_gather_plan(
-            kv_cache.view(-1, row_width),
+            kv_cache,
             staged,
             plan.row_ids,
             plan.dst_rows,
@@ -517,6 +528,7 @@ class HiSparseRuntime:
             None,
             None,
             0,
+            self.row_value_bytes or 0,
         )
         return staged
 
@@ -550,6 +562,7 @@ class HiSparseRuntime:
             src_indices,
             self.host_cache,
             dst_slots,
+            self.row_value_bytes or 0,
         )
 
     def backup_caches(
@@ -626,6 +639,7 @@ class HiSparseRuntime:
             if resident is not None and resident.view is not None
             else 0,
             0,
+            self.row_value_bytes or 0,
         )
 
         if produce_plan and group.followers and prefetch_followers:
@@ -646,6 +660,7 @@ class HiSparseRuntime:
             plan.miss_global_indices[plan_rows],
             plan.miss_hot_indices[plan_rows],
             plan.miss_counts[plan_rows],
+            self.row_value_bytes or 0,
         )
 
     def _prefetch_group(self, num_tokens: int, plan_row_offset: int = 0) -> None:
@@ -824,6 +839,7 @@ def create_hisparse_cache_handle(
     index_group_builder: HiSparseIndexGroupBuilder | None = None,
     device: torch.device | str | None = None,
     storage_block_size: int | None = None,
+    row_value_bytes: int | None = None,
 ) -> HiSparseCacheHandle | None:
     config = ResolvedHiSparseConfig.from_vllm_config(vllm_config, model_top_k)
     if config is None:
@@ -863,6 +879,7 @@ def create_hisparse_cache_handle(
         kv_dtype=kv_dtype,
         device=device,
         storage_block_size=storage_block_size,
+        row_value_bytes=row_value_bytes,
         index_group=index_group,
     )
     if is_index_group_leader and index_group_builder is not None:
