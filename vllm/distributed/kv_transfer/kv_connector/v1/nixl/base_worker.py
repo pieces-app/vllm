@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base worker-side logic for the NIXL connector."""
 
-import contextlib
 import itertools
 import logging
 import os
@@ -2672,8 +2671,7 @@ class NixlBaseConnectorWorker:
             )
 
     def __del__(self):
-        with contextlib.suppress(Exception):
-            self.shutdown()
+        self.shutdown()
 
     def shutdown(self) -> None:
         """Shutdown the connector worker."""
