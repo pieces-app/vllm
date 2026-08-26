@@ -1044,10 +1044,32 @@ class OpenAIServingChat(GenerateBaseServing):
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
             # and "stop" for named tool calls.
+            # pieces fix (upstream #50889/#53363 class): only claim
+            # finish_reason="tool_calls" when the parser actually produced
+            # tool calls. Without this, tool_choice="required" on parsers
+            # that opt out of guided enforcement (supports_required_and_named
+            # = False, e.g. gemma4) silently returns finish_reason=
+            # "tool_calls" with an EMPTY tool_calls list whenever the model
+            # skips the call — corrupting downstream agent loops. Empty
+            # required-mode results now finish as "stop" (spec-honest) and
+            # log loudly so the failure is visible instead of silent.
+            required_but_empty = (
+                request.tool_choice == "required"
+                and output.finish_reason == "stop"
+                and not tool_calls
+            )
+            if required_but_empty:
+                logger.warning(
+                    "tool_choice='required' produced no parseable tool call "
+                    "(request %s); returning finish_reason='stop' instead of "
+                    "a silently-empty tool_calls response.",
+                    request_id,
+                )
             is_finish_reason_tool_calls = auto_tools_called or (
                 request.tool_choice
                 and request.tool_choice == "required"
                 and output.finish_reason == "stop"
+                and bool(tool_calls)
             )
 
             routed_experts_b64 = (
