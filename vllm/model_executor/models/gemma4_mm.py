@@ -15,6 +15,7 @@ reason about temporal order.
 """
 
 import math
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
 
@@ -103,6 +104,13 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+# llama.cpp-parity A/B knob (2026-08 gemma-12B loop investigation): keep the
+# bidirectional image spans on FULL-attention layers instead of clearing them.
+# See _clear_mm_prefix_for_full_attn_layers.
+_GEMMA4_BIDI_FULL_LAYERS = (
+    os.environ.get("VLLM_GEMMA4_BIDI_FULL_LAYERS", "0") == "1"
+)
 
 # Video constants — match transformers Gemma4VideoProcessor defaults.
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
@@ -2158,7 +2166,18 @@ class Gemma4ForConditionalGeneration(
 
         Uses _full_attn_layer_idxs (precomputed in __init__) for O(1)
         lookup instead of per-call regex parsing.
+
+        VLLM_GEMMA4_BIDI_FULL_LAYERS=1 skips the clearing so full-attention
+        layers ALSO receive the bidirectional image spans. This matches
+        llama.cpp's mtmd behavior (non-causal image batches on BOTH the SWA
+        and full KV caches — the engine that reproduces gemma-4-12B cleanly),
+        and deliberately diverges from HF transformers, which documents
+        "causal only" for Gemma 4 global layers. Experimental A/B knob for
+        the 2026-08 gemma-12B degenerate-loop investigation; default off
+        preserves stock behavior.
         """
+        if _GEMMA4_BIDI_FULL_LAYERS:
+            return
         if not self._full_attn_layer_idxs:
             return
 

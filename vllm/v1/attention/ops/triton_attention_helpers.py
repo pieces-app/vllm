@@ -29,8 +29,14 @@ def apply_softcap(S, x):
     """Softcap (aka tanh-style clamp) used to bound attention scores.
 
     ``x * tanh(S / x)`` rewritten to avoid a direct ``tanh`` call.
+
+    ``Sdiv`` is clamped to +-30 before the exp form: fp32 ``exp`` overflows
+    to inf for ``|Sdiv|`` > ~88.7, turning the expression into inf/inf = NaN
+    and poisoning the whole softmax row. ``tanh(+-30)`` is exactly +-1.0 in
+    fp32, so the clamp is numerically lossless.
     """
     Sdiv = S / x
+    Sdiv = tl.minimum(tl.maximum(Sdiv, -30.0), 30.0)
     p1 = tl.exp(Sdiv)
     p2 = tl.exp(-Sdiv)
     return x * (p1 - p2) / (p1 + p2)
