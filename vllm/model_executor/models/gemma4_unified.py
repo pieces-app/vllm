@@ -16,9 +16,12 @@ embedding/forward path, and LoRA support are all inherited unchanged.
 """
 
 import math
+import os
 from collections.abc import Iterable, Mapping
+from types import MethodType
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers.models.gemma4_unified.configuration_gemma4_unified import (
     Gemma4UnifiedConfig,
@@ -44,8 +47,10 @@ from vllm.model_executor.models.gemma4_mm import (
     Gemma4MultimodalEmbedder,
     Gemma4MultiModalProcessor,
     Gemma4ProcessingInfo,
+    Gemma4VideoInputs,
     _get_max_soft_tokens,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
@@ -55,6 +60,106 @@ from .utils import (
     init_vllm_registered_model,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Vision-embedding numeric-fidelity A/B knobs (2026-08 gemma-4-12B loop probe)
+#
+# The Unified variant has no vision tower: raw pixel patches go straight
+# through Gemma4UnifiedVisionEmbedder (LN -> Dense -> LN -> +posemb -> LN).
+# A CPU stage-diff against an fp32 eager reference on a real screenshot
+# (pieces-app/tpu-inference tools/diagnostics/gemma4_unified_vision_diff)
+# measured, at the soft-token output: torch-eager bf16 rel 3.1e-3 / cos
+# 1.0000, torchax bf16 rel 4.4e-2 / cos 0.9944. The error concentrates on
+# near-flat patches (uniform background, faint fine text) whose std is the
+# order of the bf16 quantization step, because LayerNorm amplifies a bad
+# rstd by ~1/std.
+#
+#   VLLM_GEMMA4_VISION_LN_FP32=1 — compute the three embedder LayerNorms'
+#     statistics in fp32. This is the port of tpu-inference's shipped fix
+#     (commit 2e4fed6f), which exists because torchax lowers
+#     aten.native_layer_norm with bf16 mean/var. NOTE: PyTorch eager on CUDA
+#     ALREADY accumulates LayerNorm statistics in fp32 for bf16 inputs, so on
+#     the GPU path this is expected to be a near-no-op — it is run as the
+#     control that proves the GPU path does not share the TPU's defect.
+#   VLLM_GEMMA4_VISION_FP32=1 — run the WHOLE embedder in fp32 (params
+#     upcast; input cast in, output cast back). Upper bound: closes the
+#     residual torch-eager-bf16 gap (rel 3.1e-3) that the LN-only patch
+#     leaves in place.
+#
+# Both default off. Scope is deliberately narrow: neither knob re-states the
+# embedder's forward — re-deriving upstream's ColumnParallelLinear plumbing
+# is the trap that broke the first tpu-inference attempt (einsum shape
+# mismatch, 6912 vs 3840).
+# --------------------------------------------------------------------------- #
+_GEMMA4_VISION_LN_FP32 = os.environ.get("VLLM_GEMMA4_VISION_LN_FP32", "0") == "1"
+_GEMMA4_VISION_FP32 = os.environ.get("VLLM_GEMMA4_VISION_FP32", "0") == "1"
+_GEMMA4_EMBEDDER_LN_ATTRS = ("patch_ln1", "patch_ln2", "pos_norm")
+
+
+def _f32_stats_layer_norm_forward(self, x: torch.Tensor) -> torch.Tensor:
+    """``nn.LayerNorm.forward`` with fp32 statistics.
+
+    Identical normalized_shape/eps/affine parameters; only the arithmetic
+    precision changes. Output is cast back to the input dtype so the
+    surrounding graph stays shape- and dtype-identical.
+    """
+    orig_dtype = x.dtype
+    out = F.layer_norm(
+        x.to(torch.float32),
+        self.normalized_shape,
+        self.weight.to(torch.float32) if self.weight is not None else None,
+        self.bias.to(torch.float32) if self.bias is not None else None,
+        self.eps,
+    )
+    return out.to(orig_dtype)
+
+
+def _apply_gemma4_vision_fidelity_knobs(model: nn.Module) -> None:
+    """Apply whichever vision-embedder precision knob is enabled (if any)."""
+    embedder = getattr(model, "vision_embedder", None)
+    if embedder is None:
+        return
+
+    if _GEMMA4_VISION_FP32:
+        orig_forward = embedder.forward
+
+        def _fp32_embedder_forward(pixel_values, pixel_position_ids, *, _f=orig_forward):
+            # Cast back to whatever dtype the caller handed us, so the
+            # downstream graph (Gemma4MultimodalEmbedder -> LM) is unchanged.
+            out_dtype = pixel_values.dtype
+            out = _f(pixel_values.to(torch.float32), pixel_position_ids)
+            return out.to(out_dtype)
+
+        embedder.float()
+        embedder.forward = _fp32_embedder_forward
+        logger.info(
+            "[gemma4-unified] vision embedder running in FP32 end-to-end "
+            "(VLLM_GEMMA4_VISION_FP32=1)."
+        )
+        return
+
+    if _GEMMA4_VISION_LN_FP32:
+        patched = []
+        for attr in _GEMMA4_EMBEDDER_LN_ATTRS:
+            norm = getattr(embedder, attr, None)
+            if not isinstance(norm, nn.LayerNorm):
+                logger.warning(
+                    "[gemma4-unified] %s is not an nn.LayerNorm (%s); skipping.",
+                    attr,
+                    type(norm).__name__,
+                )
+                continue
+            norm.forward = MethodType(_f32_stats_layer_norm_forward, norm)
+            patched.append(attr)
+        if patched:
+            logger.info(
+                "[gemma4-unified] vision embedder LayerNorms %s now compute "
+                "statistics in fp32 (VLLM_GEMMA4_VISION_LN_FP32=1).",
+                ", ".join(patched),
+            )
+
 
 # Re-export so tests/code targeting the unified variant can import from here
 # rather than reaching into gemma4_mm.
@@ -265,22 +370,16 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         self.audio_tower = None
 
         # ---- Encoder-free vision embedder ----
-        self.vision_embedder = (
-            Gemma4UnifiedVisionEmbedder(
-                config.vision_config,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "vision_embedder"),
-            )
-            if config.vision_config is not None
-            else None
+        if config.vision_config is None:
+            raise ValueError("Gemma4 Unified requires a vision configuration")
+        self.vision_embedder = Gemma4UnifiedVisionEmbedder(
+            config.vision_config,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "vision_embedder"),
         )
-        self.embed_vision = (
-            Gemma4MultimodalEmbedder(
-                config.vision_config,
-                config.text_config,
-            )
-            if config.vision_config is not None
-            else None
+        self.embed_vision = Gemma4MultimodalEmbedder(
+            config.vision_config,
+            config.text_config,
         )
 
         # ---- Encoder-free audio embedder ----
@@ -350,6 +449,10 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         gen_cfg = vllm_config.model_config.try_get_generation_config()
         self._suppress_token_ids = gen_cfg.get("suppress_tokens") if gen_cfg else None
 
+        # Vision-embedder precision A/B knobs (both default off; see the
+        # module-level comment for the measured stage-diff motivating them).
+        _apply_gemma4_vision_fidelity_knobs(self)
+
     # ------------------------------------------------------------------ #
     # Multimodal processing (encoder-free overrides)
     # ------------------------------------------------------------------ #
@@ -382,7 +485,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
 
     def _process_video_input(
         self,
-        video_input: dict[str, torch.Tensor],
+        video_input: Gemma4VideoInputs,
     ) -> list[torch.Tensor]:
         """Project video frames to LM space, one frame at a time.
 
@@ -429,6 +532,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             audio_input["input_features_mask"],
         )
 
+        assert self.embed_audio is not None
         target_dtype = self.embed_audio.embedding_projection.weight.dtype
         audio_features = self.embed_audio(input_features.to(target_dtype))
         per_audio: list[torch.Tensor] = []

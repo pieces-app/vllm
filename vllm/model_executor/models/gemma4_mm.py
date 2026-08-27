@@ -15,6 +15,7 @@ reason about temporal order.
 """
 
 import math
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
 
@@ -35,7 +36,11 @@ from transformers.models.gemma4.configuration_gemma4 import (
 
 from vllm.config import VllmConfig
 from vllm.config.model import get_served_model_name
-from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
+from vllm.config.multimodal import (
+    AudioDummyOptions,
+    BaseDummyOptions,
+    VideoDummyOptions,
+)
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -99,6 +104,13 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+# llama.cpp-parity A/B knob (2026-08 gemma-12B loop investigation): keep the
+# bidirectional image spans on FULL-attention layers instead of clearing them.
+# See _clear_mm_prefix_for_full_attn_layers.
+_GEMMA4_BIDI_FULL_LAYERS = (
+    os.environ.get("VLLM_GEMMA4_BIDI_FULL_LAYERS", "0") == "1"
+)
 
 # Video constants — match transformers Gemma4VideoProcessor defaults.
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
@@ -189,6 +201,7 @@ class Gemma4VideoInputs(TensorSchema):
         torch.Tensor,
         TensorShape("bn", "np", 2),
     ]
+    video_frame_counts: Annotated[torch.Tensor, TensorShape("nv")]
 
 
 # ---------------------------------------------------------------------------
@@ -490,8 +503,10 @@ class Gemma4DummyInputsBuilder(BaseDummyInputsBuilder[Gemma4ProcessingInfo]):
         image_overrides = mm_options.get("image") if mm_options else None
         audio_overrides = mm_options.get("audio") if mm_options else None
         video_overrides = mm_options.get("video") if mm_options else None
+        assert audio_overrides is None or isinstance(audio_overrides, AudioDummyOptions)
+        assert video_overrides is None or isinstance(video_overrides, VideoDummyOptions)
 
-        data: MultiModalDataDict = {
+        data: dict[str, Any] = {
             "image": self._get_dummy_images(
                 width=img_width,
                 height=img_height,
@@ -592,6 +607,7 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
         # same vision tower, matching transformers processing_gemma4.py.
         video_outputs: dict[str, Any] = {}
         if videos := mm_data.pop("videos", []):
+            assert isinstance(videos, list)
             processor = self.info.get_hf_processor()
 
             all_video_pixel_values: list[torch.Tensor] = []
@@ -858,8 +874,29 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
 
             def get_replacement_video(item_idx: int):
                 out_item = out_mm_kwargs["video"][item_idx]
-                timestamps = out_item["video_timestamps"].data
-                num_soft = out_item["video_num_soft_tokens"].data
+                timestamps_data = out_item["video_timestamps"].data
+                if isinstance(timestamps_data, torch.Tensor):
+                    timestamps_data = timestamps_data.tolist()
+                if not isinstance(timestamps_data, list):
+                    raise TypeError("video timestamps must be a list")
+                timestamps: list[float] = []
+                for timestamp in timestamps_data:
+                    if not isinstance(timestamp, (int, float)):
+                        raise TypeError("each video timestamp must be numeric")
+                    timestamps.append(float(timestamp))
+
+                num_soft_data = out_item["video_num_soft_tokens"].data
+                if isinstance(num_soft_data, torch.Tensor):
+                    num_soft_data = num_soft_data.tolist()
+                if not isinstance(num_soft_data, list):
+                    raise TypeError("video soft-token counts must be a list")
+                num_soft: list[int] = []
+                for count in num_soft_data:
+                    if not isinstance(count, int):
+                        raise TypeError(
+                            "each video soft-token count must be an integer"
+                        )
+                    num_soft.append(count)
                 return self.info.get_video_repl(
                     timestamps=timestamps,
                     num_soft_tokens_per_frame=num_soft,
@@ -1038,6 +1075,7 @@ class Gemma4ForConditionalGeneration(
         # (Marlin, FP8, …) require dimensions divisible by 64, which
         # the vision tower (intermediate_size=4304) does not satisfy.
         # TODO(mgoin): remove this by fixing kernel padding.
+        tower_quant: QuantizationConfig | None
         if quant_config and quant_config.get_name() in [
             "bitsandbytes",
             "torchao",
@@ -1068,6 +1106,7 @@ class Gemma4ForConditionalGeneration(
             )
 
         # ---- Audio tower (variants with audio_config) ----
+        self.embed_audio: Gemma4MultimodalEmbedder | None
         if config.audio_config is not None:
             with self._mark_tower_model(vllm_config, "audio"):
                 self.audio_tower = AutoModel.from_config(config=config.audio_config)
@@ -1177,22 +1216,24 @@ class Gemma4ForConditionalGeneration(
 
     def _parse_and_validate_video_input(
         self, **kwargs: object
-    ) -> dict[str, torch.Tensor] | None:
+    ) -> Gemma4VideoInputs | None:
         pixel_values_videos = kwargs.pop("pixel_values_videos", None)
         pixel_position_ids_videos = kwargs.pop("pixel_position_ids_videos", None)
         video_frame_counts = kwargs.pop("video_frame_counts", None)
         if pixel_values_videos is None:
             return None
-        return {
-            "pixel_values_videos": pixel_values_videos,
-            "pixel_position_ids_videos": pixel_position_ids_videos,
-            "video_frame_counts": video_frame_counts,
-        }
+        return Gemma4VideoInputs(
+            pixel_values_videos=pixel_values_videos,
+            pixel_position_ids_videos=pixel_position_ids_videos,
+            video_frame_counts=video_frame_counts,
+        )
 
     def _parse_and_validate_multimodal_inputs(
         self, **kwargs: object
     ) -> dict[str, Gemma4ImageInputs | Gemma4AudioInputs | Gemma4VideoInputs | None]:
-        mm_input_by_modality = {}
+        mm_input_by_modality: dict[
+            str, Gemma4ImageInputs | Gemma4AudioInputs | Gemma4VideoInputs | None
+        ] = {}
         for input_key in list(kwargs):
             if (
                 input_key in ("pixel_values", "image_embeds")
@@ -1419,7 +1460,7 @@ class Gemma4ForConditionalGeneration(
 
     def _process_video_input(
         self,
-        video_input: dict[str, torch.Tensor],
+        video_input: Gemma4VideoInputs,
     ) -> list[torch.Tensor]:
         """Batch-encode video frames through the vision tower.
 
@@ -1543,6 +1584,8 @@ class Gemma4ForConditionalGeneration(
             audio_input["input_features_mask"],
         )
 
+        assert self.audio_tower is not None
+        assert self.embed_audio is not None
         # Run audio tower — mask convention: True=valid, False=padding.
         audio_outputs = self.audio_tower(input_features, input_features_mask)
         if isinstance(audio_outputs, tuple):
@@ -1576,14 +1619,17 @@ class Gemma4ForConditionalGeneration(
             if multimodal_input is None:
                 continue
             if modality == "image":
+                assert isinstance(multimodal_input, Gemma4ImageInputs)
                 multimodal_embeddings.extend(
                     self._process_image_input(multimodal_input)
                 )
             elif modality == "video":
+                assert isinstance(multimodal_input, Gemma4VideoInputs)
                 multimodal_embeddings.extend(
                     self._process_video_input(multimodal_input)
                 )
             elif modality == "audio":
+                assert isinstance(multimodal_input, Gemma4AudioInputs)
                 multimodal_embeddings.extend(
                     self._process_audio_input(multimodal_input)
                 )
@@ -2120,7 +2166,18 @@ class Gemma4ForConditionalGeneration(
 
         Uses _full_attn_layer_idxs (precomputed in __init__) for O(1)
         lookup instead of per-call regex parsing.
+
+        VLLM_GEMMA4_BIDI_FULL_LAYERS=1 skips the clearing so full-attention
+        layers ALSO receive the bidirectional image spans. This matches
+        llama.cpp's mtmd behavior (non-causal image batches on BOTH the SWA
+        and full KV caches — the engine that reproduces gemma-4-12B cleanly),
+        and deliberately diverges from HF transformers, which documents
+        "causal only" for Gemma 4 global layers. Experimental A/B knob for
+        the 2026-08 gemma-12B degenerate-loop investigation; default off
+        preserves stock behavior.
         """
+        if _GEMMA4_BIDI_FULL_LAYERS:
+            return
         if not self._full_attn_layer_idxs:
             return
 
@@ -2204,13 +2261,15 @@ class Gemma4ForConditionalGeneration(
         mm_kwargs: MultiModalKwargsItem | None,
         num_mm_embeds: int,
     ) -> tuple[int, int | None]:
+        tower_tokens: int | None = None
+        connector_tokens: int | None = None
         if modality in ("image", "video"):
             vision_config = self.config.vision_config
             pooling_k2 = vision_config.pooling_kernel_size**2
 
             if modality == "image":
                 pixel_values_key = "pixel_values"
-                max_soft_tokens = vision_config.default_output_length
+                max_soft_tokens = int(vision_config.default_output_length)
                 mm_processor_kwargs = getattr(
                     getattr(self, "multimodal_config", None),
                     "mm_processor_kwargs",
@@ -2241,7 +2300,7 @@ class Gemma4ForConditionalGeneration(
                     * pooling_k2
                 )
 
-        if modality == "audio":
+        elif modality == "audio":
             tower_tokens = num_mm_embeds
             connector_tokens = num_mm_embeds
 
@@ -2255,6 +2314,10 @@ class Gemma4ForConditionalGeneration(
                         tower_tokens = audio_tokens
                         connector_tokens = audio_tokens
 
+        else:
+            raise ValueError(f"Unsupported modality: {modality}")
+
+        assert tower_tokens is not None
         return tower_tokens, connector_tokens
 
     @classmethod
