@@ -292,18 +292,33 @@ class InputProcessor:
         resumable: bool = False,
         session_id: str | None = None,
     ) -> EngineCoreRequest:
-        self._validate_params(params, supported_tasks)
-        self._validate_lora(lora_request)
+        # EVERY raise below this point must invalidate the request's
+        # render-time P0 registrations (review 2026-08-28: _validate_params,
+        # _validate_lora and the dp_rank check raise BEFORE the platform
+        # hook and strand hashes identically). `processed_inputs` is not
+        # derived yet on the earliest raises, but a rendered EngineInput
+        # dict prompt already carries the hashes -- invalidate from it.
+        try:
+            self._validate_params(params, supported_tasks)
+            self._validate_lora(lora_request)
 
-        parallel_config = self.vllm_config.parallel_config
-        dp_size = parallel_config.data_parallel_size
-        dp_local_size = parallel_config.data_parallel_size_local
-        num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
-        if data_parallel_rank is not None and not (0 <= data_parallel_rank < num_ranks):
-            raise VLLMValidationError(
-                f"data_parallel_rank {data_parallel_rank} "
-                f"is out of range [0, {num_ranks})."
+            parallel_config = self.vllm_config.parallel_config
+            dp_size = parallel_config.data_parallel_size
+            dp_local_size = parallel_config.data_parallel_size_local
+            num_ranks = (
+                dp_local_size if parallel_config.local_engines_only else dp_size
             )
+            if data_parallel_rank is not None and not (
+                0 <= data_parallel_rank < num_ranks
+            ):
+                raise VLLMValidationError(
+                    f"data_parallel_rank {data_parallel_rank} "
+                    f"is out of range [0, {num_ranks})."
+                )
+        except Exception:
+            if isinstance(prompt, dict) and "type" in prompt:
+                self._invalidate_mm_hashes(prompt)  # type: ignore[arg-type]
+            raise
 
         if isinstance(prompt, dict) and "type" in prompt:
             if tokenization_kwargs:

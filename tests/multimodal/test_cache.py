@@ -884,3 +884,41 @@ def test_sleep_wake_preserves_mm_cache_consistency():
     llm.wake_up()
     output2 = llm.generate([prompt], sampling_params)
     assert output2[0].outputs[0].text
+
+
+def test_prevalidation_rejection_also_invalidates(monkeypatch):
+    """Review 2026-08-28 (verdict on this PR): _validate_params,
+    _validate_lora and the dp_rank check raise BEFORE the platform hook and
+    used to sit outside the invalidation try -- stranding render-time P0
+    registrations identically. A raise from the earliest validator must
+    leave P0 clean too."""
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    model_config = _StubModelConfig(mm_processor_cache_gb=1)
+    p0 = MultiModalProcessorSenderCache(model_config)  # type: ignore[arg-type]
+    proc = _build_input_processor(p0)
+
+    def _raise_params(self, params, supported_tasks):
+        raise VLLMValidationError("rejected before any prompt handling")
+
+    monkeypatch.setattr(InputProcessor, "_validate_params", _raise_params)
+
+    mm_hash = "image_prevalidation"
+    item = MultiModalKwargsItem.dummy(nbytes=64)
+    sent, _ = p0.get_and_update_item((item, []), mm_hash)
+    assert p0.is_cached_item(mm_hash)
+
+    with pytest.raises(VLLMValidationError):
+        proc.process_inputs(
+            request_id="req-prevalidation",
+            prompt=_rendered_mm_input(mm_hash, sent),
+            params=SamplingParams(),
+            supported_tasks=("generate",),
+        )
+
+    assert not p0.is_cached_item(mm_hash), (
+        "a pre-validation raise must invalidate render-time registrations "
+        "exactly like a platform rejection"
+    )
