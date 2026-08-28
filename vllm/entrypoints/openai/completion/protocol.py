@@ -366,6 +366,21 @@ class CompletionRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
+        # OpenAI permits `logprobs: 0` on the completions API (the chosen
+        # token's logprob is still returned; the top list keeps the documented
+        # logprobs+1 entry). Some model runners gate logprob gathering on
+        # `num_logprobs > 0` and return nothing for 0, which made this legal
+        # request 500 with an IndexError (measured 2026-08-27 on the chat
+        # sibling, same engine path), so floor the engine-side request at
+        # top-1; the response builder trims the top list back to the request's
+        # own `num_output_top_logprobs`, so the wire shape is unchanged.
+        # Parity with the chat sibling fixed in PR #2 (completions contract).
+        engine_num_logprobs: int | None = None
+        if not self.logprob_token_ids:
+            engine_num_logprobs = self.logprobs
+            if engine_num_logprobs == 0:
+                engine_num_logprobs = 1
+
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -378,7 +393,7 @@ class CompletionRequest(OpenAIBaseModel):
             seed=self.seed,
             stop=self.stop,
             stop_token_ids=stop_token_ids,
-            logprobs=None if self.logprob_token_ids else self.logprobs,
+            logprobs=engine_num_logprobs,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,

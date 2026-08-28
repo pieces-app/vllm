@@ -18,6 +18,7 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.scale_out.render.serving import ServingRender
 from vllm.exceptions import VLLMValidationError
+from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -647,3 +648,117 @@ def test_non_numeric_logprobs_rejected(field_name):
             max_tokens=10,
             **{field_name: "2"},
         )
+
+
+def _build_minimal_logprobs_serving_completion() -> OpenAIServingCompletion:
+    serving = OpenAIServingCompletion.__new__(OpenAIServingCompletion)
+    serving.return_tokens_as_token_ids = False
+    return serving
+
+
+def test_completion_logprobs_short_engine_data_no_500():
+    """Regression for the crash site: a backend may return *fewer* logprob
+    positions than sampled tokens (seen with `logprobs: 0` on backends that
+    gate logprob gathering on `num_logprobs > 0`). The request must degrade to
+    token-only entries instead of raising IndexError -> HTTP 500. Sibling of
+    the chat fix in PR #2."""
+    serving = _build_minimal_logprobs_serving_completion()
+    tokenizer = MagicMock()
+    tokenizer.decode.return_value = "tok"
+
+    result = serving._create_completion_logprobs(
+        token_ids=[10, 11, 12],
+        top_logprobs=[],
+        num_output_top_logprobs=0,
+        tokenizer=tokenizer,
+    )
+
+    assert result.tokens == ["tok", "tok", "tok"]
+    assert result.token_logprobs == [None, None, None]
+    assert result.top_logprobs == [None, None, None]
+
+
+def test_completion_logprobs_partial_engine_data_keeps_real_entries():
+    """Control for the degrade path: positions the runner *did* return keep
+    their real logprob; only the missing tail degrades."""
+    serving = _build_minimal_logprobs_serving_completion()
+    tokenizer = MagicMock()
+    tokenizer.decode.return_value = "tok"
+
+    result = serving._create_completion_logprobs(
+        token_ids=[10, 11],
+        top_logprobs=[{10: Logprob(logprob=-0.1, rank=1, decoded_token="a")}],
+        num_output_top_logprobs=0,
+        tokenizer=tokenizer,
+    )
+
+    assert result.tokens == ["a", "tok"]
+    assert result.token_logprobs[0] == pytest.approx(-0.1)
+    assert result.token_logprobs[1] is None
+    assert result.top_logprobs[0] == {"a": pytest.approx(-0.1)}
+    assert result.top_logprobs[1] is None
+
+
+def test_completion_logprobs_full_engine_data_unchanged():
+    """Regression control: when the runner returns one logprob position per
+    sampled token, the output is exactly what it was before the bounds check."""
+    serving = _build_minimal_logprobs_serving_completion()
+
+    result = serving._create_completion_logprobs(
+        token_ids=[10, 11],
+        top_logprobs=[
+            {10: Logprob(logprob=-0.1, rank=1, decoded_token="a")},
+            {11: Logprob(logprob=-0.2, rank=1, decoded_token="b")},
+        ],
+        num_output_top_logprobs=0,
+        tokenizer=None,
+    )
+
+    assert result.tokens == ["a", "b"]
+    assert result.token_logprobs[0] == pytest.approx(-0.1)
+    assert result.token_logprobs[1] == pytest.approx(-0.2)
+    # The legacy completions contract keeps logprobs+1 entries in the top list.
+    assert result.top_logprobs == [
+        {"a": pytest.approx(-0.1)},
+        {"b": pytest.approx(-0.2)},
+    ]
+
+
+def test_to_sampling_params_floors_logprobs_zero():
+    """`logprobs: 0` is a legal completions request. Floor it to top-1
+    engine-side so runners that skip gathering for 0 still emit the chosen
+    token's logprob; the response builder trims the top list back. Sibling of
+    the chat `top_logprobs=0` floor in PR #2."""
+
+    def _sampling_params(**kwargs):
+        request = CompletionRequest(
+            model=MODEL_NAME,
+            prompt="Test prompt",
+            **kwargs,
+        )
+        return request.to_sampling_params(max_tokens=10, default_sampling_params={})
+
+    assert _sampling_params(logprobs=0).logprobs == 1
+    # Explicit counts and -1 (all) pass through unchanged.
+    assert _sampling_params(logprobs=5).logprobs == 5
+    assert _sampling_params(logprobs=-1).logprobs == -1
+    # logprobs unset -> no engine logprobs.
+    assert _sampling_params().logprobs is None
+    # logprob_token_ids path is unaffected by the floor.
+    params = _sampling_params(logprobs=0, logprob_token_ids=[1, 2])
+    assert params.logprobs is None
+    assert params.logprob_token_ids == [1, 2]
+
+
+def test_to_sampling_params_floor_does_not_touch_echo_prompt_logprobs():
+    """The floor is engine-side for *sampled* logprobs only: `echo` still
+    derives prompt_logprobs from the request's own value."""
+    request = CompletionRequest(
+        model=MODEL_NAME,
+        prompt="Test prompt",
+        logprobs=0,
+        echo=True,
+    )
+    params = request.to_sampling_params(max_tokens=10, default_sampling_params={})
+    assert params.logprobs == 1
+    assert params.prompt_logprobs == 0
