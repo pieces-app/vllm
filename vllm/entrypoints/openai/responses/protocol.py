@@ -432,12 +432,27 @@ class ResponsesRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             extra_args["ec_transfer_params"] = self.ec_transfer_params
 
+        # `top_logprobs` DEFAULTS TO 0 on this endpoint, so the ordinary way
+        # to ask for logprobs -- include "message.output_text.logprobs" and
+        # leave top_logprobs alone -- asked the engine for zero of them and
+        # silently returned none, while the identical request shape on chat
+        # and completions returns the chosen token's logprob. That is a
+        # contract divergence between our own endpoints, not a missing
+        # extra. Floor the ENGINE request at top-1 exactly as
+        # completion/protocol.py does; the echo above still reports the
+        # user's own value, so the wire contract is unchanged.
+        engine_num_logprobs: int | None = None
+        if self.is_include_output_logprobs():
+            engine_num_logprobs = self.top_logprobs
+            if engine_num_logprobs == 0:
+                engine_num_logprobs = 1
+
         return SamplingParams.from_optional(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             max_tokens=max_tokens,
-            logprobs=self.top_logprobs if self.is_include_output_logprobs() else None,
+            logprobs=engine_num_logprobs,
             stop=stop,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
@@ -775,7 +790,19 @@ class ResponsesResponse(OpenAIBaseModel):
             frequency_penalty=sampling_params.frequency_penalty,
             status=status,
             text=request.text,
-            top_logprobs=sampling_params.logprobs,
+            # ECHO THE REQUEST, NOT THE ENGINE. Every neighbouring identity
+            # field here echoes `request.*` (text, truncation, user,
+            # tool_choice, tools); this one alone reported the engine's
+            # value. That was byte-identical while nothing modified it --
+            # this expression is exactly the one at the SamplingParams
+            # construction site below -- but it makes the echo independent
+            # of engine-side adjustments, which the floor immediately below
+            # introduces.
+            top_logprobs=(
+                request.top_logprobs
+                if request.is_include_output_logprobs()
+                else None
+            ),
             truncation=request.truncation,
             user=request.user,
             usage=usage,
