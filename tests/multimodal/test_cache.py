@@ -333,6 +333,197 @@ def test_mm_cache_miss_batches_all_drifted_hashes():
     assert "A" in p1._cache and "C" in p1._cache
 
 
+def _rendered_mm_input(mm_hash: str, data):
+    """A minimal already-rendered MultiModalInput, as handed to
+    ``InputProcessor.process_inputs`` after the renderer has registered
+    ``mm_hash`` in the P0 processor cache."""
+    return {
+        "type": "multimodal",
+        "prompt_token_ids": [1, 2, 3],
+        "prompt": "<image>",
+        "mm_kwargs": {"image": [data]},
+        "mm_hashes": {"image": [mm_hash]},
+        "mm_placeholders": {"image": [PlaceholderRange(offset=1, length=1)]},
+    }
+
+
+def _build_input_processor(p0_cache):
+    """Real InputProcessor wired to a real P0 sender cache.
+
+    ``InputProcessor.__init__`` builds a renderer from a real model config
+    (Hugging Face lookup), so construct via ``__new__`` and set only the
+    attributes ``process_inputs()`` reads. Everything under test --
+    ``process_inputs`` itself, ``_invalidate_mm_hashes``, and the
+    ``MultiModalProcessorSenderCache`` registration/invalidation -- is the
+    production code path.
+    """
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    proc = InputProcessor.__new__(InputProcessor)
+    proc.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_size_local=1,
+            local_engines_only=False,
+        ),
+        reasoning_config=None,
+    )
+    proc.model_config = SimpleNamespace(
+        max_logprobs=20,
+        get_vocab_size=lambda: 32_000,
+        logits_processors=None,
+        is_diffusion=False,
+        return_sampling_mask=False,
+        max_model_len=8192,
+        runner_type="generate",
+    )
+    proc.lora_config = None
+    proc.speculative_config = None
+    proc.structured_outputs_config = None
+    proc.generation_config_fields = {}
+    proc.supports_mm_inputs = True
+    proc.mm_encoder_cache_size = 8192
+    proc.skip_prompt_length_check = False
+    proc.renderer = SimpleNamespace(
+        tokenizer=None,
+        mm_processor_cache=p0_cache,
+        get_eos_token_id=lambda: None,
+    )
+    return proc
+
+
+def test_rejected_request_invalidates_render_time_registration(monkeypatch):
+    """One rejected request must not poison subsequent vision requests.
+
+    Live failure this guards against: mm hashes are registered in the P0
+    processor cache at RENDER time, before platform request validation runs.
+    When the platform then rejects the request (e.g. a TPU platform plugin
+    refusing per-request seed), the registered hashes used to be stranded:
+    P0 kept claiming they were cached on P1 (which never saw the rejected
+    request), so every later request reusing those images had its data
+    stripped to ``None`` and failed with P0/P1 cache-drift errors until
+    process restart. ``process_inputs`` must unregister exactly the hashes
+    the rejected request registered.
+    """
+    from vllm.sampling_params import SamplingParams
+
+    model_config = _StubModelConfig(mm_processor_cache_gb=1)
+    p0 = MultiModalProcessorSenderCache(model_config)  # type: ignore[arg-type]
+    p1 = MultiModalReceiverCache(model_config)  # type: ignore[arg-type]
+    proc = _build_input_processor(p0)
+
+    class _SeedRejectingPlatform:
+        """Mimics a platform whose validate_request hook rejects seeds."""
+
+        @staticmethod
+        def validate_request(processed_inputs, params):
+            if params.seed is not None:
+                raise ValueError("Torch XLA does not support per-request seed.")
+
+    monkeypatch.setattr(
+        "vllm.v1.engine.input_processor.current_platform",
+        _SeedRejectingPlatform,
+    )
+
+    mm_hash = "image_shared"
+    item = MultiModalKwargsItem.dummy(nbytes=64)
+
+    # RENDER TIME (request 1, seeded): the mm item is registered in the P0
+    # shadow cache before any validation has run.
+    sent, _ = p0.get_and_update_item((item, []), mm_hash)
+    assert sent is item
+    assert p0.is_cached_item(mm_hash)
+
+    # VALIDATION: the platform rejects the seeded request after registration.
+    with pytest.raises(ValueError, match="per-request seed"):
+        proc.process_inputs(
+            request_id="req-seeded",
+            prompt=_rendered_mm_input(mm_hash, sent),
+            params=SamplingParams(seed=42),
+            supported_tasks=("generate",),
+        )
+
+    # THE FIX: rejection unregistered the hash this request registered.
+    # (Pre-fix, P0 still claimed the hash was cached on P1 at this point.)
+    assert not p0.is_cached_item(mm_hash)
+
+    # REQUEST 2 (valid, same image): renders and registers again -- the data
+    # is re-sent instead of stripped to None...
+    resent, _ = p0.get_and_update_item((item, []), mm_hash)
+    assert resent is item
+    # ...passes validation and produces an engine request...
+    engine_request = proc.process_inputs(
+        request_id="req-valid",
+        prompt=_rendered_mm_input(mm_hash, resent),
+        params=SamplingParams(),
+        supported_tasks=("generate",),
+    )
+    assert engine_request.mm_features is not None
+    assert [f.mm_hash for f in engine_request.mm_features] == [mm_hash]
+    # ...and P1 receives real data: no MultiModalCacheMissError drift.
+    assert p1.get_and_update_item(resent, mm_hash) is item
+    # A later data-stripped request for the now-cached hash also serves.
+    assert p1.get_and_update_item(None, mm_hash) is item
+
+
+def test_valid_mm_request_registration_survives_validation(monkeypatch):
+    """Control: a valid mm request still registers and serves normally.
+
+    Invalidate-on-reject must only run on rejection: after a request passes
+    validation, its P0 shadow entry must survive so the next request with
+    the same image legitimately skips re-sending the data to P1.
+    """
+    from vllm.sampling_params import SamplingParams
+
+    model_config = _StubModelConfig(mm_processor_cache_gb=1)
+    p0 = MultiModalProcessorSenderCache(model_config)  # type: ignore[arg-type]
+    p1 = MultiModalReceiverCache(model_config)  # type: ignore[arg-type]
+    proc = _build_input_processor(p0)
+
+    validated = []
+
+    class _AcceptingPlatform:
+        @staticmethod
+        def validate_request(processed_inputs, params):
+            validated.append(processed_inputs["mm_hashes"])
+
+    monkeypatch.setattr(
+        "vllm.v1.engine.input_processor.current_platform",
+        _AcceptingPlatform,
+    )
+
+    mm_hash = "image_valid"
+    item = MultiModalKwargsItem.dummy(nbytes=64)
+
+    # Render-time registration, then a request that passes validation.
+    sent, _ = p0.get_and_update_item((item, []), mm_hash)
+    assert sent is item
+    engine_request = proc.process_inputs(
+        request_id="req-ok",
+        prompt=_rendered_mm_input(mm_hash, sent),
+        params=SamplingParams(),
+        supported_tasks=("generate",),
+    )
+    assert validated  # the platform hook really ran
+
+    # Registration survives acceptance: P0 still shadows the hash...
+    assert p0.is_cached_item(mm_hash)
+    # ...the engine request carries the mm feature with its data...
+    assert engine_request.mm_features is not None
+    assert [f.mm_hash for f in engine_request.mm_features] == [mm_hash]
+    assert engine_request.mm_features[0].data is item
+    # ...and P1 ingests it.
+    assert p1.get_and_update_item(sent, mm_hash) is item
+
+    # Next request with the same image: P0 legitimately strips the data
+    # (HIT on the shadow cache) and P1 serves it from its own cache.
+    hit, _ = p0.get_and_update_item((item, []), mm_hash)
+    assert hit is None
+    assert p1.get_and_update_item(None, mm_hash) is item
+
+
 def _run_test_cache_eviction_lru(
     p0_cache: BaseMultiModalProcessorCache,
     p1_cache: BaseMultiModalReceiverCache,
@@ -693,3 +884,41 @@ def test_sleep_wake_preserves_mm_cache_consistency():
     llm.wake_up()
     output2 = llm.generate([prompt], sampling_params)
     assert output2[0].outputs[0].text
+
+
+def test_prevalidation_rejection_also_invalidates(monkeypatch):
+    """Review 2026-08-28 (verdict on this PR): _validate_params,
+    _validate_lora and the dp_rank check raise BEFORE the platform hook and
+    used to sit outside the invalidation try -- stranding render-time P0
+    registrations identically. A raise from the earliest validator must
+    leave P0 clean too."""
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    model_config = _StubModelConfig(mm_processor_cache_gb=1)
+    p0 = MultiModalProcessorSenderCache(model_config)  # type: ignore[arg-type]
+    proc = _build_input_processor(p0)
+
+    def _raise_params(self, params, supported_tasks):
+        raise VLLMValidationError("rejected before any prompt handling")
+
+    monkeypatch.setattr(InputProcessor, "_validate_params", _raise_params)
+
+    mm_hash = "image_prevalidation"
+    item = MultiModalKwargsItem.dummy(nbytes=64)
+    sent, _ = p0.get_and_update_item((item, []), mm_hash)
+    assert p0.is_cached_item(mm_hash)
+
+    with pytest.raises(VLLMValidationError):
+        proc.process_inputs(
+            request_id="req-prevalidation",
+            prompt=_rendered_mm_input(mm_hash, sent),
+            params=SamplingParams(),
+            supported_tasks=("generate",),
+        )
+
+    assert not p0.is_cached_item(mm_hash), (
+        "a pre-validation raise must invalidate render-time registrations "
+        "exactly like a platform rejection"
+    )
