@@ -498,7 +498,15 @@ class ServingTokens(GenerateBaseServing):
 
         for i, token_id in enumerate(token_ids):
             token = f"token_id:{token_id}"
-            step_top_logprobs = top_logprobs[i]
+            # A runner may return fewer logprob positions than sampled tokens
+            # (seen with `logprobs: 0` on backends that gate logprob gathering
+            # on `num_logprobs > 0`, which 500ed a legal request with an
+            # IndexError; measured 2026-08-27 on the chat sibling). This
+            # endpoint takes a raw SamplingParams straight from the caller, so
+            # it cannot floor the count the way the validated OpenAI protocols
+            # do -- the bounds check is what keeps a 0 from crashing it.
+            # Parity with the chat sibling fixed in PR #2 (token-in-token-out).
+            step_top_logprobs = top_logprobs[i] if i < len(top_logprobs) else None
             if step_top_logprobs is None or step_top_logprobs.get(token_id) is None:
                 logprobs_content.append(
                     ChatCompletionLogProbsContent(
