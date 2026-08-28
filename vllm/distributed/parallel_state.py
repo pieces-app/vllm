@@ -2160,7 +2160,19 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
     gc.collect()
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cpu():
+    # `not is_cpu()` is not the same question as "there is an accelerator to
+    # clean up". UnspecifiedPlatform -- what vLLM resolves to when platform
+    # detection finds nothing, e.g. any dev machine without the deployment
+    # target's runtime -- reports is_cpu() == False, so this branch ran and
+    # called accelerator APIs on a host that has none. torch may still report
+    # an accelerator there (on macOS `torch.accelerator.current_accelerator()`
+    # is `mps`), so probing torch does not save us either:
+    # `empty_host_cache()` SEGFAULTS on that path, taking the whole pytest
+    # process down in an autouse teardown fixture -- which makes the entire
+    # entrypoints suite unrunnable off-accelerator, one test after the first
+    # one passes. Skip when we do not know what we are on; there is nothing
+    # this function could correctly free.
+    if not current_platform.is_cpu() and not current_platform.is_unspecified():
         torch.accelerator.empty_cache()
         try:
             torch.accelerator.empty_host_cache()
