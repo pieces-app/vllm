@@ -232,6 +232,31 @@ class InputProcessor:
                 exc_info=True,
             )
 
+    def _invalidate_mm_hashes(self, processed_inputs: EngineInput) -> None:
+        """Drop a rejected request's mm hashes from the P0 processor cache.
+
+        Rendering registers mm hashes in the P0 (frontend) shadow cache
+        before request validation runs (see ``process_inputs``). When
+        validation rejects the request (e.g. a platform ``validate_request``
+        hook raising on an unsupported per-request seed), the request never
+        reaches P1, so the registered hashes are stranded: P0 would forever
+        claim they are cached on P1 and strip the data from later requests,
+        which then fail with P0/P1 cache-drift errors. Invalidating a hash
+        that an earlier request already cached is safe: the next request
+        simply re-sends the data and P1 re-caches it.
+        """
+        mm_cache = self.renderer.mm_processor_cache
+        if mm_cache is None:
+            return
+
+        encoder_inputs, decoder_inputs = split_enc_dec_input(processed_inputs)
+        for singleton_inputs in (encoder_inputs, decoder_inputs):
+            if singleton_inputs is None or singleton_inputs["type"] != "multimodal":
+                continue
+            for mm_hash in json_iter_leaves(singleton_inputs["mm_hashes"]):
+                if isinstance(mm_hash, str):
+                    mm_cache.invalidate(mm_hash)
+
     @staticmethod
     def assign_request_id(request: EngineCoreRequest):
         """Replace the externally supplied request ID with an internal request ID
@@ -307,10 +332,24 @@ class InputProcessor:
                 tokenization_kwargs=tokenization_kwargs,
             )
 
-        current_platform.validate_request(processed_inputs, params)
+        try:
+            current_platform.validate_request(processed_inputs, params)
 
-        encoder_inputs, decoder_inputs = split_enc_dec_input(processed_inputs)
-        self._validate_model_inputs(encoder_inputs, decoder_inputs)
+            encoder_inputs, decoder_inputs = split_enc_dec_input(processed_inputs)
+            self._validate_model_inputs(encoder_inputs, decoder_inputs)
+        except Exception:
+            # This request's mm hashes were registered in the P0 processor
+            # cache at RENDER time (renderer -> mm_processor.apply ->
+            # cache.get_and_update), i.e. BEFORE this validation ran. A
+            # rejected request never reaches P1, so P1 never receives the
+            # data; without cleanup, P0 keeps claiming these hashes are
+            # cached and strips the data from every later request that
+            # reuses them, failing all subsequent vision traffic with
+            # P0/P1 cache-drift errors until process restart. One rejected
+            # seeded request must not break subsequent vision requests:
+            # unregister exactly the hashes this request registered.
+            self._invalidate_mm_hashes(processed_inputs)
+            raise
 
         # Mypy can be conservative for TypedDict unions; normalize access.
         if decoder_inputs["type"] == "embeds":
