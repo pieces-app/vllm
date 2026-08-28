@@ -709,6 +709,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
+
+        # OpenAI permits logprobs=true with top_logprobs=0 (also the field's
+        # default): return the chosen token's logprob with an empty
+        # top_logprobs list. Some model runners gate logprob gathering on
+        # `num_logprobs > 0` and return nothing for 0, which made this legal
+        # request 500 with an IndexError (measured 2026-08-27), so floor the
+        # engine-side request at top-1; the response builder
+        # (_get_top_logprobs) trims the top list back to the requested 0.
+        engine_num_logprobs: int | None = None
+        if self.logprobs and not self.logprob_token_ids:
+            engine_num_logprobs = self.top_logprobs
+            if engine_num_logprobs == 0:
+                engine_num_logprobs = 1
+
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -721,11 +735,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             seed=self.seed,
             stop=self.stop,
             stop_token_ids=stop_token_ids,
-            logprobs=(
-                self.top_logprobs
-                if self.logprobs and not self.logprob_token_ids
-                else None
-            ),
+            logprobs=engine_num_logprobs,
             prompt_logprobs=prompt_logprobs,
             logprob_token_ids=self.logprob_token_ids or None,
             ignore_eos=self.ignore_eos,
