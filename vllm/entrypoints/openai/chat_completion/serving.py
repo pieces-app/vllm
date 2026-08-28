@@ -312,6 +312,12 @@ class OpenAIServingChat(GenerateBaseServing):
                     self.default_sampling_params,
                 )
 
+            # Fail-closed guard: structured output x speculative decoding
+            # (incident 2026-08-28; see GenerateBaseServing).
+            guard_error = self._check_spec_decode_structured_output(sampling_params)
+            if guard_error is not None:
+                return guard_error
+
             self._log_inputs(
                 sub_request_id,
                 engine_input,

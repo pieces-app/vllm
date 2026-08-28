@@ -2279,7 +2279,20 @@ class Scheduler(SchedulerInterface):
             orig_num_spec_tokens = len(placeholder_spec_tokens)
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
-            del spec_token_ids[orig_num_spec_tokens:]
+            #
+            # NOTE: Some executor backends deliver the per-request draft ids
+            # as an immutable sequence (e.g. a tuple), on which in-place
+            # `del`/`extend` raises AttributeError and kills the engine core
+            # (EngineDeadError; incident 2026-08-28: structured output +
+            # speculative decoding on the TPU runner). This method is only
+            # reached on the deferred structured-output path, so the plain
+            # spec-decode path never trips on it. Materialize a mutable list
+            # before truncating; the common list case stays allocation-free
+            # because `del lst[n:]` with len(lst) <= n allocates nothing.
+            if isinstance(spec_token_ids, list):
+                del spec_token_ids[orig_num_spec_tokens:]
+            else:
+                spec_token_ids = list(spec_token_ids[:orig_num_spec_tokens])
             # Filter out spec tokens which do not adhere to the grammar.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
@@ -2287,8 +2300,17 @@ class Scheduler(SchedulerInterface):
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:
+                if not isinstance(spec_token_ids, list):
+                    # A grammar backend may also hand back an immutable
+                    # sequence; never mutate one in place.
+                    spec_token_ids = list(spec_token_ids)
                 spec_token_ids.extend([-1] * num_invalid_tokens)
                 num_invalid_spec_tokens[req_id] = num_invalid_tokens
+
+            # Write the (possibly re-materialized) truncated list back to the
+            # scheduler output; downstream consumers (get_grammar_bitmask and
+            # the worker-side batch update) read it from there, not from the
+            # local variable.
 
             sched_spec_tokens[req_id] = spec_token_ids
 

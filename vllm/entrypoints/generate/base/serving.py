@@ -3,7 +3,8 @@
 import json
 import time
 from collections.abc import Awaitable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
+from dataclasses import fields as dataclass_fields
 from http import HTTPStatus
 from typing import ClassVar, Generic, TypeVar
 
@@ -29,6 +30,11 @@ from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.sampling_params import (
+    BeamSearchParams,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import (
     contains_trace_headers,
@@ -43,6 +49,45 @@ RequestT = TypeVar("RequestT", bound=AnyRequest)
 _T = TypeVar("_T")
 SESSION_ID_HEADER = "X-Session-ID"
 PRIORITY_HEADER = "X-Vllm-Priority"
+
+# ---------------------------------------------------------------------------
+# Fail-closed guard: structured output x speculative decoding.
+#
+# Incident 2026-08-28: a structured-output request served while speculative
+# decoding was active killed the engine core (AttributeError in
+# `Scheduler.update_draft_token_ids_in_output` truncating an immutable
+# draft-token sequence -> EngineDeadError, ~4.5-minute outage; deterministic
+# at concurrency 1). The scheduler root cause is fixed in
+# vllm/v1/core/sched/scheduler.py, which makes the standard constraint kinds
+# below safe again. This guard remains as defense in depth so that any OTHER
+# latent spec-decode x structured-output interaction fails the single request
+# with HTTP 400 instead of the whole engine: while speculation is active, a
+# structured-output request is rejected unless every constraint kind it uses
+# is in the validated allowlist below.
+#
+# Removal: this flag is the single switch — set it to False to disable the
+# guard entirely; nothing else depends on it.
+GUARD_SPEC_DECODE_STRUCTURED_OUTPUT: bool = True
+
+# Structured-output constraint kinds validated to take the fixed scheduler
+# path (all are trimmed in `Scheduler.update_draft_token_ids_in_output` and
+# routed through `grammar.validate_tokens`). A kind not listed here — e.g.
+# one introduced by a future merge — fails closed with HTTP 400 while
+# speculative decoding is active.
+SPEC_DECODE_SAFE_STRUCTURED_OUTPUT_KINDS: frozenset[str] = frozenset(
+    {"json", "json_object", "regex", "choice", "grammar", "structural_tag"}
+)
+
+# StructuredOutputsParams fields that are tuning options rather than
+# constraint kinds; they only affect grammar compilation, not which scheduler
+# path the request takes, so they are exempt from the allowlist check.
+_SPEC_DECODE_STRUCTURED_OPTION_FIELDS: frozenset[str] = frozenset(
+    {
+        "disable_any_whitespace",
+        "disable_additional_properties",
+        "whitespace_pattern",
+    }
+)
 
 
 def build_per_request_timing_metrics(
@@ -138,6 +183,9 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         vllm_config = getattr(engine_client, "vllm_config", None)
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
         self.has_kv_connector = kv_transfer_config is not None
+        # Needed by the fail-closed structured-output x spec-decode guard
+        # (see GUARD_SPEC_DECODE_STRUCTURED_OUTPUT above).
+        self.speculative_config = getattr(vllm_config, "speculative_config", None)
 
         # Computed once at startup (cached by ``vllm_config`` identity) and
         # stamped on non-streaming responses. Streaming chunks deliberately
@@ -168,6 +216,79 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
             ).model_dump()
         )
         return json_str
+
+    def _check_spec_decode_structured_output(
+        self, params: SamplingParams | BeamSearchParams
+    ) -> ErrorResponse | None:
+        """Fail-closed guard for structured output x speculative decoding.
+
+        See GUARD_SPEC_DECODE_STRUCTURED_OUTPUT at module level. Returns an
+        HTTP 400 ErrorResponse when speculative decoding is active and the
+        request carries a structured-output constraint that is not validated
+        to take the fixed scheduler path; returns None when the request is
+        safe to admit.
+        """
+        if not GUARD_SPEC_DECODE_STRUCTURED_OUTPUT:
+            return None
+        if self.speculative_config is None:
+            # No speculation configured on this engine: nothing to guard.
+            return None
+        struct_out = getattr(params, "structured_outputs", None)
+        if struct_out is None:
+            # Not a structured-output request (includes beam search params).
+            return None
+        if isinstance(struct_out, StructuredOutputsParams):
+            # Enumerate constraint state dynamically from the dataclass so
+            # that a constraint kind added by a future merge is caught here
+            # (fails closed) instead of silently reaching the engine.
+            active_kinds: list[str] = []
+            for f in dataclass_fields(struct_out):
+                name = f.name
+                if name.startswith("_"):
+                    # Internal bookkeeping (_backend, ...).
+                    continue
+                if name in _SPEC_DECODE_STRUCTURED_OPTION_FIELDS:
+                    # Known tuning options; do not select a scheduler path.
+                    continue
+                default = f.default
+                if default is MISSING and f.default_factory is not MISSING:  # type: ignore[misc]
+                    default = f.default_factory()  # type: ignore[misc]
+                value = getattr(struct_out, name)
+                is_set = (
+                    value is not None if default is MISSING else value != default
+                )
+                if is_set:
+                    active_kinds.append(name)
+            unsafe_kinds = sorted(
+                set(active_kinds) - SPEC_DECODE_SAFE_STRUCTURED_OUTPUT_KINDS
+            )
+        else:
+            # Unknown carrier of structured-output state: we cannot prove it
+            # takes the validated path, so fail closed.
+            unsafe_kinds = [f"<{type(struct_out).__name__}>"]
+        if not unsafe_kinds:
+            return None
+        spec_method = getattr(self.speculative_config, "method", None)
+        return self.create_error_response(
+            message=(
+                f"Structured output constraint kind(s) {unsafe_kinds} are not "
+                "validated for use with speculative decoding "
+                f"(method={spec_method!r}), which is active on this server. "
+                "Rejecting this request instead of risking the engine: on "
+                "2026-08-28 a structured-output request combined with "
+                "speculative decoding crashed the engine core "
+                "(EngineDeadError), causing a multi-minute outage for all "
+                "requests. Validated kinds: "
+                f"{sorted(SPEC_DECODE_SAFE_STRUCTURED_OUTPUT_KINDS)}. Either "
+                "remove the structured output constraint (response_format / "
+                "structured_outputs) from the request, or have the server "
+                "operator disable speculative decoding "
+                "(--speculative-config)."
+            ),
+            err_type="BadRequestError",
+            status_code=HTTPStatus.BAD_REQUEST,
+            param="response_format",
+        )
 
     def _raise_if_error(self, finish_reason: str | None, request_id: str) -> None:
         """Raise GenerationError if finish_reason indicates an error."""

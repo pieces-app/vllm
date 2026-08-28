@@ -446,6 +446,12 @@ class OpenAIServingResponses(GenerateBaseServing):
                 default_max_tokens, self.default_sampling_params
             )
 
+            # Fail-closed guard: structured output x speculative decoding
+            # (incident 2026-08-28; see GenerateBaseServing).
+            maybe_error = self._check_spec_decode_structured_output(sampling_params)
+            if maybe_error is not None:
+                return maybe_error
+
             trace_headers = (
                 None
                 if raw_request is None
