@@ -1251,7 +1251,12 @@ class OpenAIServingChat(GenerateBaseServing):
             else self.return_tokens_as_token_ids
         )
         for i, token_id in enumerate(token_ids):
-            step_top_logprobs = top_logprobs[i]
+            # A runner may return fewer logprob positions than sampled tokens
+            # (seen with top_logprobs=0 on backends that skip logprob
+            # gathering, which 500ed a legal OpenAI request; measured
+            # 2026-08-27). Degrade to token-only entries instead of an
+            # IndexError that fails the whole request.
+            step_top_logprobs = top_logprobs[i] if i < len(top_logprobs) else None
             if step_top_logprobs is None or step_top_logprobs.get(token_id) is None:
                 if should_return_as_token_id:
                     token = format_token_id_placeholder(token_id)

@@ -44,12 +44,14 @@ from vllm.entrypoints.openai.models.serving import (
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import TokensPrompt
+from vllm.logprobs import Logprob
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import HarmonyParser
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.mistral import MistralRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
+from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import get_tokenizer
 from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.tokenizers.registry import cached_tokenizer_from_config
@@ -771,6 +773,166 @@ async def test_chat_per_request_metrics_suppressed_for_n_greater_than_one():
         request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
     )
     assert response.metrics is None
+
+
+def _build_minimal_logprobs_serving_chat() -> OpenAIServingChat:
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.return_tokens_as_token_ids = False
+    return serving
+
+
+def _make_logprobs_request_output(
+    token_ids: tuple[int, ...],
+    logprobs: list[dict[int, Logprob] | None] | None,
+) -> RequestOutput:
+    return RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="Hello",
+                token_ids=list(token_ids),
+                cumulative_logprob=None,
+                logprobs=logprobs,
+                finish_reason="stop",
+            )
+        ],
+        finished=True,
+    )
+
+
+def _chat_logprobs_request(top_logprobs: int) -> ChatCompletionRequest:
+    return ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Test prompt"}],
+        max_tokens=10,
+        stream=False,
+        logprobs=True,
+        top_logprobs=top_logprobs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_logprobs_top_logprobs_zero_returns_chosen_logprob():
+    # Regression: logprobs=true with top_logprobs=0 (the OpenAI default) must
+    # return the chosen token's logprob with an empty top_logprobs list, not
+    # 500 (measured 2026-08-27 with backends that skip logprob gathering).
+    serving = _build_minimal_logprobs_serving_chat()
+    request_output = _make_logprobs_request_output(
+        token_ids=(10, 11),
+        logprobs=[
+            {10: Logprob(logprob=-0.1, rank=1, decoded_token="a")},
+            {11: Logprob(logprob=-0.2, rank=1, decoded_token="b")},
+        ],
+    )
+    response = await serving.chat_completion_full_generator(
+        _chat_logprobs_request(top_logprobs=0),
+        _single_request_output(request_output),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    )
+    assert not isinstance(response, ErrorResponse)
+    content = response.choices[0].logprobs.content
+    assert len(content) == 2
+    assert content[0].logprob == pytest.approx(-0.1)
+    assert content[1].logprob == pytest.approx(-0.2)
+    assert content[0].token == "a"
+    assert content[1].token == "b"
+    assert content[0].top_logprobs == []
+    assert content[1].top_logprobs == []
+
+
+@pytest.mark.asyncio
+async def test_chat_logprobs_top_logprobs_one_still_returns_top_list():
+    # Regression control: top_logprobs=1 keeps returning a one-entry top list.
+    serving = _build_minimal_logprobs_serving_chat()
+    request_output = _make_logprobs_request_output(
+        token_ids=(10, 11),
+        logprobs=[
+            {10: Logprob(logprob=-0.1, rank=1, decoded_token="a")},
+            {11: Logprob(logprob=-0.2, rank=1, decoded_token="b")},
+        ],
+    )
+    response = await serving.chat_completion_full_generator(
+        _chat_logprobs_request(top_logprobs=1),
+        _single_request_output(request_output),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    )
+    assert not isinstance(response, ErrorResponse)
+    content = response.choices[0].logprobs.content
+    assert len(content) == 2
+    assert content[0].logprob == pytest.approx(-0.1)
+    assert len(content[0].top_logprobs) == 1
+    assert content[0].top_logprobs[0].token == "a"
+    assert content[0].top_logprobs[0].logprob == pytest.approx(-0.1)
+    assert len(content[1].top_logprobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_logprobs_empty_engine_data_no_500():
+    # Regression for the crash site: a backend may return an *empty* logprobs
+    # list while still producing sampled tokens (seen with top_logprobs=0 on
+    # backends that gate logprob gathering on num_logprobs > 0). The request
+    # must degrade to token-only entries instead of raising IndexError.
+    serving = _build_minimal_logprobs_serving_chat()
+    request_output = _make_logprobs_request_output(
+        token_ids=(10, 11, 12),
+        logprobs=[],
+    )
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.decode.return_value = "tok"
+    response = await serving.chat_completion_full_generator(
+        _chat_logprobs_request(top_logprobs=0),
+        _single_request_output(request_output),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=mock_tokenizer,
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    )
+    assert not isinstance(response, ErrorResponse)
+    content = response.choices[0].logprobs.content
+    assert len(content) == 3
+    assert all(entry.token == "tok" for entry in content)
+
+
+def test_to_sampling_params_floors_top_logprobs_zero():
+    def _sampling_params(**kwargs) -> SamplingParams:
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            **kwargs,
+        )
+        return request.to_sampling_params(
+            max_tokens=10, default_sampling_params={}
+        )
+
+    # top_logprobs=0 (the OpenAI default) is floored to 1 engine-side so
+    # backends that skip gathering for 0 still return the chosen-token
+    # logprob; the response shaper trims the top list back to 0.
+    assert _sampling_params(logprobs=True, top_logprobs=0).logprobs == 1
+    # Explicit counts and -1 (all) pass through unchanged.
+    assert _sampling_params(logprobs=True, top_logprobs=5).logprobs == 5
+    assert _sampling_params(logprobs=True, top_logprobs=-1).logprobs == -1
+    # logprobs disabled -> no engine logprobs.
+    assert _sampling_params(logprobs=False).logprobs is None
+    assert _sampling_params().logprobs is None
+    # logprob_token_ids path is unaffected by the floor.
+    params = _sampling_params(
+        logprobs=True, top_logprobs=0, logprob_token_ids=[1, 2]
+    )
+    assert params.logprobs is None
+    assert params.logprob_token_ids == [1, 2]
 
 
 @pytest.mark.asyncio
