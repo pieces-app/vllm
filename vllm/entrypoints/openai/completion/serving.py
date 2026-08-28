@@ -136,6 +136,13 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 "Streaming is not currently supported with beam search"
             )
 
+        # Pre-render fail-closed guard: structured output x speculative
+        # decoding (incident 2026-08-28). Runs BEFORE render so a rejection
+        # cannot strand P0 mm-cache registrations.
+        early_guard = self._check_spec_decode_structured_output_request(request)
+        if early_guard is not None:
+            return early_guard
+
         result = await self.render_completion_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -177,6 +184,12 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+
+            # Fail-closed guard: structured output x speculative decoding
+            # (incident 2026-08-28; see GenerateBaseServing).
+            guard_error = self._check_spec_decode_structured_output(sampling_params)
+            if guard_error is not None:
+                return guard_error
 
             request_id_item = f"{request_id}-{i}"
 

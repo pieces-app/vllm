@@ -381,6 +381,13 @@ class OpenAIServingResponses(GenerateBaseServing):
         lora_request = self._maybe_get_adapters(request)
         model_name = self.models.model_name(lora_request)
 
+        # Pre-render fail-closed guard: structured output x speculative
+        # decoding (incident 2026-08-28). Runs BEFORE render so a rejection
+        # cannot strand P0 mm-cache registrations.
+        early_guard = self._check_spec_decode_structured_output_request(request)
+        if early_guard is not None:
+            return early_guard
+
         if self.use_harmony:
             messages, engine_inputs = self._make_request_with_harmony(
                 request, prev_response
@@ -445,6 +452,12 @@ class OpenAIServingResponses(GenerateBaseServing):
             sampling_params = request.to_sampling_params(
                 default_max_tokens, self.default_sampling_params
             )
+
+            # Fail-closed guard: structured output x speculative decoding
+            # (incident 2026-08-28; see GenerateBaseServing).
+            maybe_error = self._check_spec_decode_structured_output(sampling_params)
+            if maybe_error is not None:
+                return maybe_error
 
             trace_headers = (
                 None
