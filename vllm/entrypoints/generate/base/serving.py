@@ -252,6 +252,17 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         invalidation fix in v1/engine/input_processor.py for the engine-side
         rejection path). The params-level check remains as a backstop for
         entry paths without the request hook.
+
+        DELIBERATE BEHAVIOR CHANGE for beam search (review 2026-08-28):
+        the params-level check exempted beam requests structurally, because
+        BeamSearchParams carries no structured_outputs. This request-level
+        check derives from the request itself, so a beam-search request
+        with an UNVALIDATED structured-output kind on a speculation-enabled
+        engine is now rejected too. That is the conservative reading: the
+        guard cannot know whether the engine disables speculation
+        per-request under beam, and an untested interaction should fail a
+        request, not reach the scheduler. Validated kinds remain admitted
+        under beam exactly as elsewhere.
         """
         if not GUARD_SPEC_DECODE_STRUCTURED_OUTPUT:
             return None

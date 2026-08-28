@@ -263,3 +263,31 @@ def test_early_guard_precedes_render_in_every_serving_source():
             f"{rel}: early guard must precede render "
             f"(guard at {guard_idx}, render at {render_idx})"
         )
+
+
+def test_early_guard_beam_search_with_unsafe_kind_rejected():
+    """Deliberate behavior change, pinned (review 2026-08-28): beam-search
+    requests were structurally exempt at the params level (BeamSearchParams
+    has no structured_outputs); the request-level early guard rejects an
+    UNVALIDATED kind under beam on a speculation-enabled engine -- the
+    conservative reading. Validated kinds stay admitted (next test)."""
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        use_beam_search=True,
+        structured_outputs=FutureStructuredOutputsParams(
+            json_object=True, ebnf_v2="root ::= 'x'"
+        ),
+    )
+    result = _check_request(request, SPEC_CONFIG)
+    _assert_rejected_400(result, expect_in_message=("ebnf_v2",))
+
+
+def test_early_guard_beam_search_with_validated_kind_admitted():
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        use_beam_search=True,
+        response_format={"type": "json_object"},
+    )
+    assert _check_request(request, SPEC_CONFIG) is None
