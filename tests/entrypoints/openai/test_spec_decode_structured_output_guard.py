@@ -44,14 +44,30 @@ class FutureStructuredOutputsParams(StructuredOutputsParams):
     ebnf_v2: str | None = None
 
 
-def _check(params, speculative_config):
-    """Run the guard exactly as the serving paths do, on a minimal self."""
-    fake_serving = SimpleNamespace(
+def _fake_serving(speculative_config):
+    fake = SimpleNamespace(
         speculative_config=speculative_config,
         create_error_response=GenerateBaseServing.create_error_response,
     )
+    fake._reject_unsafe_structured_outputs = (
+        lambda struct_out: GenerateBaseServing._reject_unsafe_structured_outputs(
+            fake, struct_out
+        )
+    )
+    return fake
+
+
+def _check(params, speculative_config):
+    """Run the guard exactly as the serving paths do, on a minimal self."""
     return GenerateBaseServing._check_spec_decode_structured_output(
-        fake_serving, params
+        _fake_serving(speculative_config), params
+    )
+
+
+def _check_request(request, speculative_config):
+    """Run the EARLY (pre-render) guard exactly as the serving paths do."""
+    return GenerateBaseServing._check_spec_decode_structured_output_request(
+        _fake_serving(speculative_config), request
     )
 
 
@@ -165,3 +181,85 @@ def test_single_flag_disables_guard(monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Early (pre-render) guard variant + source-order composition proof.
+# ---------------------------------------------------------------------------
+
+
+class _FakeUnsafeRequest:
+    """Request stand-in whose extract_structured_outputs returns an
+    unvalidated future kind -- must be rejected by the EARLY guard."""
+
+    def __init__(self, struct_out):
+        self._struct_out = struct_out
+
+    def extract_structured_outputs(self):
+        return self._struct_out
+
+
+def test_early_guard_rejects_unsafe_request():
+    result = _check_request(
+        _FakeUnsafeRequest(
+            FutureStructuredOutputsParams(json_object=True, ebnf_v2="root ::= 'x'")
+        ),
+        SPEC_CONFIG,
+    )
+    _assert_rejected_400(result, expect_in_message=("ebnf_v2", "'mtp'"))
+
+
+def test_early_guard_admits_validated_kind_via_real_request():
+    """End to end on the REAL request class: response_format json_object
+    maps to a validated kind, so the early guard admits it pre-render."""
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        response_format={"type": "json_object"},
+    )
+    assert _check_request(request, SPEC_CONFIG) is None
+
+
+def test_early_guard_admits_request_without_hook():
+    class NoHook:
+        pass
+
+    assert _check_request(NoHook(), SPEC_CONFIG) is None
+
+
+def test_early_guard_admits_no_structured_outputs():
+    assert _check_request(_FakeUnsafeRequest(None), SPEC_CONFIG) is None
+
+
+def test_early_guard_precedes_render_in_every_serving_source():
+    """Composition proof (ruling 2026-08-28): in every serving entrypoint the
+    pre-render guard call appears BEFORE the render/request-build call, so a
+    guard rejection cannot strand P0 mm-cache registrations. Source-order
+    pin, same style as the fork's other ordering pins."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3]
+    cases = [
+        (
+            "vllm/entrypoints/openai/chat_completion/serving.py",
+            "result = await self.render_chat_request(request)",
+        ),
+        (
+            "vllm/entrypoints/openai/completion/serving.py",
+            "result = await self.render_completion_request(request)",
+        ),
+        (
+            "vllm/entrypoints/openai/responses/serving.py",
+            "messages, engine_inputs = self._make_request_with_harmony(",
+        ),
+    ]
+    for rel, render_anchor in cases:
+        src = (root / rel).read_text()
+        guard_idx = src.find("_check_spec_decode_structured_output_request(request)")
+        render_idx = src.find(render_anchor)
+        assert guard_idx != -1, f"early guard call missing in {rel}"
+        assert render_idx != -1, f"render anchor missing in {rel}"
+        assert guard_idx < render_idx, (
+            f"{rel}: early guard must precede render "
+            f"(guard at {guard_idx}, render at {render_idx})"
+        )

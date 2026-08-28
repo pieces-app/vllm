@@ -237,6 +237,37 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         if struct_out is None:
             # Not a structured-output request (includes beam search params).
             return None
+        return self._reject_unsafe_structured_outputs(struct_out)
+
+    def _check_spec_decode_structured_output_request(
+        self, request: object
+    ) -> ErrorResponse | None:
+        """Pre-render fail-closed guard (early variant).
+
+        Same policy as _check_spec_decode_structured_output, derived from
+        the REQUEST via its extract_structured_outputs() hook -- so it runs
+        BEFORE multimodal rendering registers P0 cache entries, and a
+        rejection cannot strand registrations (composition ruling
+        2026-08-28: validation precedes side effects; see the P0
+        invalidation fix in v1/engine/input_processor.py for the engine-side
+        rejection path). The params-level check remains as a backstop for
+        entry paths without the request hook.
+        """
+        if not GUARD_SPEC_DECODE_STRUCTURED_OUTPUT:
+            return None
+        if self.speculative_config is None:
+            return None
+        extract = getattr(request, "extract_structured_outputs", None)
+        if extract is None or not callable(extract):
+            return None
+        struct_out = extract()
+        if struct_out is None:
+            return None
+        return self._reject_unsafe_structured_outputs(struct_out)
+
+    def _reject_unsafe_structured_outputs(
+        self, struct_out: object
+    ) -> ErrorResponse | None:
         if isinstance(struct_out, StructuredOutputsParams):
             # Enumerate constraint state dynamically from the dataclass so
             # that a constraint kind added by a future merge is caught here

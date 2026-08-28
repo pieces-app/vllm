@@ -227,3 +227,59 @@ def test_grammar_backend_returning_immutable_sequence_is_padded():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class _ZeroDScalar:
+    """Stand-in for a 0-d device scalar: int()-able, but not an int --
+    exactly what list(jax_row) yields per element."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def __int__(self):
+        return self._value
+
+    def __eq__(self, other):
+        return int(self) == other
+
+    def __hash__(self):
+        return hash(self._value)
+
+
+class _TolistSeq:
+    """Sequence with numpy/jax-style tolist(): slicing returns another
+    _TolistSeq (as jax slicing returns an Array), iteration/indexing yields
+    0-d scalars (as jax does), and ONLY tolist() yields python ints. This
+    makes the tolist-branch behaviorally distinguishable: the plain
+    list(...) fallback stores scalars, the tolist() path stores ints."""
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    def __len__(self):
+        return len(self._items)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return _TolistSeq(self._items[key])
+        return _ZeroDScalar(self._items[key])
+
+    def tolist(self):
+        return [int(x) for x in self._items]
+
+
+def test_tolist_sequence_materializes_to_int_list():
+    """The tolist() branch (jax/numpy/ArrayImpl shape): stored value must be
+    a plain list of python ints -- not wrapped elements, not the original
+    object (review condition on the #3 verdict: tolist()-aware
+    materialization avoids 0-d device scalars downstream)."""
+    fake_scheduler = _make_fake_scheduler(should_advance=False)
+    scheduler_output = _make_scheduler_output(num_placeholder_spec_tokens=2)
+
+    _run(fake_scheduler, scheduler_output, _TolistSeq([11, 12, 13, 14]))
+
+    stored = scheduler_output.scheduled_spec_decode_tokens[REQ_ID]
+    assert isinstance(stored, list)
+    assert stored == [11, 12]
+    assert all(type(x) is int for x in stored)
+    assert scheduler_output.num_invalid_spec_tokens == {}

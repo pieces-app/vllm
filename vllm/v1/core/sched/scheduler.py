@@ -2291,6 +2291,13 @@ class Scheduler(SchedulerInterface):
             # because `del lst[n:]` with len(lst) <= n allocates nothing.
             if isinstance(spec_token_ids, list):
                 del spec_token_ids[orig_num_spec_tokens:]
+            elif hasattr(spec_token_ids, "tolist"):
+                # jax ArrayImpl (the incident's runtime type, review-verified
+                # via the __delitem__ slot quirk) and numpy arrays: slice
+                # then tolist() so downstream holds python ints -- list(...)
+                # would yield 0-d device scalars, functional but paying a
+                # per-element device sync.
+                spec_token_ids = spec_token_ids[:orig_num_spec_tokens].tolist()
             else:
                 spec_token_ids = list(spec_token_ids[:orig_num_spec_tokens])
             # Filter out spec tokens which do not adhere to the grammar.
@@ -2303,7 +2310,11 @@ class Scheduler(SchedulerInterface):
                 if not isinstance(spec_token_ids, list):
                     # A grammar backend may also hand back an immutable
                     # sequence; never mutate one in place.
-                    spec_token_ids = list(spec_token_ids)
+                    spec_token_ids = (
+                        spec_token_ids.tolist()
+                        if hasattr(spec_token_ids, "tolist")
+                        else list(spec_token_ids)
+                    )
                 spec_token_ids.extend([-1] * num_invalid_tokens)
                 num_invalid_spec_tokens[req_id] = num_invalid_tokens
 
