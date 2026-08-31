@@ -301,18 +301,7 @@ class StructuredOutputManager:
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
                     advance_grammar = apply_bitmask
                     if token == -1:
-                        # A -1 draft is an invalid/pad speculative token: skip
-                        # the FSM advance (no real token to accept), but DO NOT
-                        # stop constraining subsequent rows. Those rows are the
-                        # target model's recovery-token positions; latching
-                        # apply_bitmask=False here filled them with _full_mask
-                        # (all-tokens-allowed), so the target could sample an
-                        # out-of-grammar token that then tripped the FSM
-                        # (measured: 1/16 constrained MTP requests died,
-                        # issue #152). The grammar does not advance past the
-                        # pad, so every post-`-1` row reflects the same
-                        # last-valid-token FSM state, which is the correct
-                        # constraint for a recovery token.
+                        apply_bitmask = False
                         advance_grammar = False
                     elif (
                         detect_reasoning_end
